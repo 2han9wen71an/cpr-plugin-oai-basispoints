@@ -720,16 +720,52 @@ async fn send_relay_failure(
             encode_sse_frame("response.failed", &event),
             false,
         ))
+        .await?;
+    sender
+        .send(MiddlewareBodyFrame::new(b"data: [DONE]\n\n".to_vec(), true))
         .await
 }
 
 fn transform_json_response(relay: &RelayContext, body: &[u8]) -> Result<Vec<u8>, RelayError> {
-    let response = serde_json::from_slice::<Value>(body).map_err(|_| RelayError {
+    if let Ok(response) = serde_json::from_slice::<Value>(body) {
+        return transform_json_value(relay, &response, body);
+    }
+    for event in sse::parse_sse_events(body)
+        .into_iter()
+        .filter(|event| !event.is_done())
+    {
+        let event = sse::parse_json_event(&event).map_err(|_| RelayError {
+            status: 502,
+            code: "invalid_upstream_response",
+            message: "Basis Points returned invalid JSON/SSE".to_owned(),
+        })?;
+        if matches!(
+            event.event_type(),
+            Some("response.completed" | "response.incomplete")
+        ) {
+            let response = event.value().get("response").unwrap_or(event.value());
+            return serde_json::to_vec(&relay.transform_response(response)?.response).map_err(
+                |_| RelayError {
+                    status: 502,
+                    code: "relay_encoding_failed",
+                    message: "client tool relay response could not be encoded".to_owned(),
+                },
+            );
+        }
+    }
+    Err(RelayError {
         status: 502,
         code: "invalid_upstream_response",
-        message: "Basis Points returned invalid JSON".to_owned(),
-    })?;
-    let transformed = relay.transform_response(&response)?;
+        message: "Basis Points returned no terminal JSON response".to_owned(),
+    })
+}
+
+fn transform_json_value(
+    relay: &RelayContext,
+    response: &Value,
+    original: &[u8],
+) -> Result<Vec<u8>, RelayError> {
+    let transformed = relay.transform_response(response)?;
     if transformed.changed {
         serde_json::to_vec(&transformed.response).map_err(|_| RelayError {
             status: 502,
@@ -737,8 +773,7 @@ fn transform_json_response(relay: &RelayContext, body: &[u8]) -> Result<Vec<u8>,
             message: "client tool relay response could not be encoded".to_owned(),
         })
     } else {
-        // Preserve non-tool responses byte-for-byte, including unknown fields.
-        Ok(body.to_vec())
+        Ok(original.to_vec())
     }
 }
 
