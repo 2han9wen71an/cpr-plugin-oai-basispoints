@@ -1,0 +1,145 @@
+name: Release Plugin
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag name (defaults to v<version> in plugin.json)'
+        required: false
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build (${{ matrix.arch }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            arch: x86_64
+          - target: aarch64-unknown-linux-musl
+            arch: aarch64
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Set up Zig
+        uses: mlugg/setup-zig@v1
+        with:
+          version: 0.13.0
+
+      - name: Cache cargo tools
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin/cargo-zigbuild
+          key: ${{ runner.os }}-cargo-zigbuild-v0.19.7
+
+      - name: Install cargo-zigbuild
+        run: |
+          which cargo-zigbuild || cargo install cargo-zigbuild --version 0.19.7 --locked
+
+      - name: Cache Cargo Dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            backend/target/
+          key: ${{ runner.os }}-cargo-${{ matrix.target }}-${{ hashFiles('backend/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-${{ matrix.target }}-
+
+      - name: Build target binary
+        run: |
+          cargo zigbuild --release --target ${{ matrix.target }} --manifest-path backend/Cargo.toml
+
+      - name: Package plugin
+        run: |
+          python3 scripts/package.py \
+            --binary backend/target/${{ matrix.target }}/release/cpr-plugin-oai-basispoints \
+            --arch ${{ matrix.arch }} \
+            --out-dir dist
+
+      - name: Upload dist artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist-${{ matrix.arch }}
+          path: dist/*
+          if-no-files-found: error
+
+  publish:
+    name: Publish Release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Download all built artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Assemble release assets and generate checksums.txt
+        run: |
+          mkdir -p release-dist
+          find artifacts -type f \( -name "*.tar.gz" -o -name "*.sha256" \) -exec cp {} release-dist/ \;
+
+          cd release-dist
+          # Generate standard checksums.txt required by CPR GitHub update sources
+          rm -f checksums.txt
+          for f in *.tar.gz; do
+            sha256sum "$f" >> checksums.txt
+          done
+          echo "=== Release Assets ==="
+          ls -la
+          echo "=== checksums.txt ==="
+          cat checksums.txt
+
+      - name: Determine tag name
+        id: get_tag
+        run: |
+          if [ -n "${{ github.event.inputs.tag }}" ]; then
+            TAG="${{ github.event.inputs.tag }}"
+          elif [[ "${{ github.ref }}" == refs/tags/* ]]; then
+            TAG="${GITHUB_REF#refs/tags/}"
+          else
+            VERSION=$(python3 -c "import json; print(json.load(open('plugin.json'))['version'])")
+            TAG="v$VERSION"
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
+      - name: Create or Update GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.get_tag.outputs.tag }}
+        run: |
+          # If tag does not exist on remote, create and push it
+          if ! git rev-parse "$TAG" >/dev/null 2>&1; then
+            git tag "$TAG"
+            git push origin "$TAG"
+          fi
+
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Release $TAG exists, uploading assets..."
+            gh release upload "$TAG" release-dist/* --clobber
+          else
+            echo "Creating new release $TAG..."
+            gh release create "$TAG" release-dist/* \
+              --title "Release $TAG" \
+              --generate-notes
+          fi
