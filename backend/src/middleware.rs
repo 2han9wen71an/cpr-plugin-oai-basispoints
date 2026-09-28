@@ -291,14 +291,11 @@ async fn pump_stream(
             let done = frame.done;
             match delivery.accept(frame.bytes, done) {
                 Ok(frames) => {
-                    if send_frames(&sender, frames, false).await.is_err() {
+                    if send_frames(&sender, frames).await.is_err() {
                         let _ = upstream::close_stream(&host, &stream_id).await;
                         return;
                     }
                     if done {
-                        let _ = sender
-                            .send(MiddlewareBodyFrame::new(b"data: [DONE]\n\n".to_vec(), true))
-                            .await;
                         let _ = upstream::close_stream(&host, &stream_id).await;
                         return;
                     }
@@ -323,9 +320,17 @@ async fn pump_stream(
         }
         if eof {
             if let Some(frame) = splitter.finish() {
-                match delivery.accept(frame.bytes, frame.done) {
+                let done = frame.done;
+                match delivery.accept(frame.bytes, done) {
                     Ok(frames) => {
-                        if send_frames(&sender, frames, false).await.is_err() {
+                        if send_frames(&sender, frames).await.is_err() {
+                            let _ = upstream::close_stream(&host, &stream_id).await;
+                            return;
+                        }
+                        if done {
+                            let _ = sender
+                                .send(MiddlewareBodyFrame::new(b"data: [DONE]\n\n".to_vec(), true))
+                                .await;
                             let _ = upstream::close_stream(&host, &stream_id).await;
                             return;
                         }
@@ -359,7 +364,7 @@ async fn pump_stream(
     }
     match delivery.finish() {
         Ok(frames) => {
-            if send_frames(&sender, frames, false).await.is_err() {
+            if send_frames(&sender, frames).await.is_err() {
                 let _ = upstream::close_stream(&host, &stream_id).await;
             } else {
                 upstream::trace_fault(&host, "pump_completed").await;
@@ -385,13 +390,9 @@ async fn pump_stream(
 async fn send_frames(
     sender: &gateway_plugin_sdk::client::MiddlewareBodySender,
     frames: Vec<Vec<u8>>,
-    terminal: bool,
 ) -> Result<(), gateway_plugin_sdk::client::SessionError> {
-    for (index, bytes) in frames.into_iter().enumerate() {
-        let is_terminal = terminal && index == 0;
-        sender
-            .send(MiddlewareBodyFrame::new(bytes, is_terminal))
-            .await?;
+    for bytes in frames {
+        sender.send(MiddlewareBodyFrame::new(bytes, false)).await?;
     }
     Ok(())
 }
