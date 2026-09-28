@@ -412,12 +412,20 @@ impl RelaySseDelivery {
         bytes: Vec<u8>,
         done_frame: bool,
     ) -> Result<Vec<Vec<u8>>, RelayDeliveryError> {
+        if !self.active {
+            // Preserve the legacy no-relay path exactly, including dropping the
+            // upstream [DONE] control frame.
+            return Ok(if done_frame { Vec::new() } else { vec![bytes] });
+        }
         if done_frame {
+            if !self.terminal_seen {
+                return Err(RelayDeliveryError::MissingTerminal);
+            }
             self.done_seen = true;
             return Ok(Vec::new());
         }
-        if !self.active {
-            return Ok(vec![bytes]);
+        if self.terminal_seen || self.done_seen {
+            return Err(RelayDeliveryError::EventsAfterTerminal);
         }
 
         let event = match sse::parse_sse_json_event(&bytes) {
@@ -510,12 +518,13 @@ impl RelaySseDelivery {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq)]
 enum RelayDeliveryError {
     Relay(RelayError),
     InvalidTerminal,
     MissingTerminal,
     ToolEventsWithoutTransformedCall,
+    EventsAfterTerminal,
 }
 
 impl RelayDeliveryError {
@@ -530,6 +539,9 @@ impl RelayDeliveryError {
             }
             Self::ToolEventsWithoutTransformedCall => {
                 "Basis Points returned tool events without a valid client tool call".to_owned()
+            }
+            Self::EventsAfterTerminal => {
+                "Basis Points returned events after the terminal event".to_owned()
             }
         }
     }
@@ -796,4 +808,50 @@ pub fn error_response(status: u16, code: &str, message: &str) -> MiddlewareRespo
             vec![MiddlewareBodyFrame::new(body, true)],
         ),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::relay::ToolRelay;
+
+    #[test]
+    fn synthetic_sse_frames_use_real_event_boundaries() {
+        assert_eq!(
+            encode_sse_frame("response.completed", &json!({"type": "response.completed"})),
+            b"event: response.completed\ndata: {\"type\":\"response.completed\"}\n\n"
+        );
+    }
+
+    #[test]
+    fn no_relay_sse_delivery_preserves_frames_and_drops_done() {
+        let mut delivery = RelaySseDelivery::new(None);
+        assert_eq!(
+            delivery.accept(b"event: text\ndata: hello\n\n".to_vec(), false),
+            Ok(vec![b"event: text\ndata: hello\n\n".to_vec()])
+        );
+        assert_eq!(
+            delivery.accept(b"data: [DONE]\n\n".to_vec(), true),
+            Ok(Vec::new())
+        );
+        assert_eq!(delivery.finish(), Ok(Vec::new()));
+    }
+
+    #[test]
+    fn json_relay_preserves_non_tool_response_bytes() {
+        let source = json!({
+            "tools": [{"type": "function", "name": "exec", "parameters": {"type": "object"}}]
+        })
+        .as_object()
+        .expect("object source")
+        .clone();
+        let prepared = ToolRelay::new()
+            .prepare_source(&source)
+            .expect("relay preparation");
+        let body = br#"{"id":"resp_1","status":"completed","output":[]}"#;
+        assert_eq!(
+            transform_json_response(prepared.relay_context(), body).expect("response transform"),
+            body
+        );
+    }
 }

@@ -443,15 +443,6 @@ pub fn rewrite_input(
     context.rewrite_input(input)
 }
 
-/// Rewrites an input history using the supplied relay context.
-#[must_use = "history rewrite errors must be handled"]
-pub fn rewrite_input_with_context(
-    context: &RelayContext,
-    input: Option<&Value>,
-) -> Result<Vec<Value>, RelayError> {
-    context.rewrite_input(input)
-}
-
 /// Transforms a response with a prepared context.
 pub fn transform_response(
     context: &RelayContext,
