@@ -1,0 +1,99 @@
+{
+  "manifestVersion": 1,
+  "name": "oai-basispoints",
+  "displayName": "OpenAI Basis Points",
+  "publisher": "2han9wen71an",
+  "version": "0.1.0",
+  "description": "复用宿主 Codex OAuth 凭据接入 Basis Points（bps.openai.com），以短路中间件提供 Responses 流式代理",
+  "license": "MIT",
+  "author": "2han9wen71an",
+  "engines": {
+    "codex-proxy-rs": ">=3.16.0, <4.0.0"
+  },
+  "main": "bin/plugin",
+  "runtime": "trustedProcess",
+  "contributes": {
+    "model_catalog": {},
+    "middleware": {
+      "stages": [
+        "request"
+      ],
+      "inputFormats": [
+        "openai"
+      ],
+      "outputFormats": [
+        "openai"
+      ]
+    }
+  },
+  "permissions": [
+    "network",
+    "accounts",
+    "requests"
+  ],
+  "configurationSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "required": [
+      "responsesUrl",
+      "models"
+    ],
+    "properties": {
+      "responsesUrl": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 512,
+        "default": "https://bps.openai.com/basispoints/api/responses",
+        "title": "Basis Points Responses 接口地址"
+      },
+      "models": {
+        "type": "array",
+        "minItems": 1,
+        "maxItems": 64,
+        "title": "公开别名与上游模型映射",
+        "items": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "alias",
+            "upstreamModel"
+          ],
+          "properties": {
+            "alias": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 128,
+              "title": "对外模型别名"
+            },
+            "upstreamModel": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 128,
+              "title": "Basis Points 上游模型"
+            }
+          }
+        },
+        "default": [
+          {
+            "alias": "gpt-6-astra-basispoints",
+            "upstreamModel": "gpt-6-astra"
+          }
+        ]
+      },
+      "catalogTarget": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 128,
+        "default": "gpt-5.3-codex",
+        "title": "目录别名形式指向的原生 openai 模型（请求不会真正路由到它）"
+      },
+      "maxResponseBytes": {
+        "type": "integer",
+        "minimum": 65536,
+        "maximum": 134217728,
+        "default": 67108864,
+        "title": "上游响应体大小上限（字节）"
+      }
+    }
+  }
+}
