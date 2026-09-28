@@ -39,8 +39,8 @@ impl RuntimeConfig {
         if !responses_url.starts_with("https://") {
             return Err(InvalidConfig("responsesUrl 必须是 https 地址".to_owned()));
         }
-        let catalog_target = string_field(object, "catalogTarget")?
-            .unwrap_or_else(|| "gpt-5.3-codex".to_owned());
+        let catalog_target =
+            string_field(object, "catalogTarget")?.unwrap_or_else(|| "gpt-5.3-codex".to_owned());
         let max_response_bytes = match object.get("maxResponseBytes") {
             None | Some(Value::Null) => 64 * 1024 * 1024,
             Some(value) => value
@@ -57,14 +57,13 @@ impl RuntimeConfig {
             Some(Value::Array(items)) => {
                 let mut models = Vec::with_capacity(items.len());
                 for item in items {
-                    let entry = item.as_object().ok_or_else(|| {
-                        InvalidConfig("models 条目必须是对象".to_owned())
-                    })?;
+                    let entry = item
+                        .as_object()
+                        .ok_or_else(|| InvalidConfig("models 条目必须是对象".to_owned()))?;
                     let alias = string_field(entry, "alias")?
                         .ok_or_else(|| InvalidConfig("alias 不能为空".to_owned()))?;
-                    let upstream_model = string_field(entry, "upstreamModel")?.ok_or_else(|| {
-                        InvalidConfig("upstreamModel 不能为空".to_owned())
-                    })?;
+                    let upstream_model = string_field(entry, "upstreamModel")?
+                        .ok_or_else(|| InvalidConfig("upstreamModel 不能为空".to_owned()))?;
                     models.push(ModelMapping {
                         alias,
                         upstream_model,
@@ -106,16 +105,12 @@ impl RuntimeConfig {
             .map(|entry| entry.upstream_model.as_str())
     }
 
-    #[must_use]
     pub fn aliases(&self) -> impl Iterator<Item = &str> {
         self.models.iter().map(|entry| entry.alias.as_str())
     }
 }
 
-fn string_field(
-    object: &Map<String, Value>,
-    key: &str,
-) -> Result<Option<String>, InvalidConfig> {
+fn string_field(object: &Map<String, Value>, key: &str) -> Result<Option<String>, InvalidConfig> {
     match object.get(key) {
         None | Some(Value::Null) => Ok(None),
         Some(Value::String(text)) => {

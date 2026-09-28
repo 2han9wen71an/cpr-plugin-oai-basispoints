@@ -17,10 +17,7 @@ pub fn auth_headers(access_token: &str, account_id: &str, stream: bool) -> Vec<(
         "application/json"
     };
     vec![
-        (
-            "authorization".to_owned(),
-            format!("Bearer {access_token}"),
-        ),
+        ("authorization".to_owned(), format!("Bearer {access_token}")),
         ("chatgpt-account-id".to_owned(), account_id.to_owned()),
         ("x-openai-account-id".to_owned(), account_id.to_owned()),
         ("x-basispoints-auth-mode".to_owned(), "chatgpt".to_owned()),
@@ -194,7 +191,11 @@ where
     O: DeserializeOwned,
 {
     let HostReply { result, payload } = host
-        .call(method, json!({}), serde_json::to_vec(input).map_err(|_| fault("请求编码失败"))?)
+        .call(
+            method,
+            json!({}),
+            serde_json::to_vec(input).map_err(|_| fault("请求编码失败"))?,
+        )
         .await
         .map_err(SessionError::into_plugin_fault)?;
     if !result.is_null() && result != json!({}) {
@@ -219,6 +220,10 @@ pub async fn trace_fault(host: &HostClient, step: &'static str) {
         fields: Default::default(),
     };
     let _ = host
-        .call("host.log", serde_json::to_value(&request).unwrap_or(json!({})), Vec::new())
+        .call(
+            "host.log",
+            serde_json::to_value(&request).unwrap_or(json!({})),
+            Vec::new(),
+        )
         .await;
 }

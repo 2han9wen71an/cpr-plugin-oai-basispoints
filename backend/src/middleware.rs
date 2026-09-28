@@ -4,15 +4,16 @@ use std::sync::Arc;
 use gateway_plugin_sdk::{
     PluginFault,
     call::middleware::{MiddlewareBodyFrame, MiddlewareBodyFraming, MiddlewareMount},
-    client::{MiddlewareBody, MiddlewareCall, MiddlewareResponse},
+    client::{CallCancellation, MiddlewareBody, MiddlewareCall, MiddlewareResponse},
 };
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 
 use crate::{
     accounts::AccountPicker,
     config::RuntimeConfig,
-    protocol::{self, ProtocolError},
-    sse::SseFrameSplitter,
+    protocol::{self, PreparedRequest, ProtocolError},
+    relay::{RelayContext, RelayError},
+    sse::{self, SseFrameSplitter, SseJsonEvent, SseStreamTracker},
     upstream,
 };
 
@@ -26,17 +27,25 @@ async fn trace(host: &gateway_plugin_sdk::client::HostClient, step: &str, detail
     let request = gateway_plugin_sdk::call::host::LogRequest {
         event: format!("oai-basispoints.{step}"),
         level: gateway_plugin_sdk::call::host::LogLevel::Info,
-        fields: [("detail".to_owned(), json!(detail))]
-            .into_iter()
-            .collect(),
+        fields: [("detail".to_owned(), json!(detail))].into_iter().collect(),
     };
-    let reply = host.call("host.log", serde_json::to_value(&request).unwrap_or(json!({})), Vec::new());
+    let reply = host.call(
+        "host.log",
+        serde_json::to_value(&request).unwrap_or(json!({})),
+        Vec::new(),
+    );
     let _ = reply.await;
 }
 
-pub async fn handle(handler: Handler, call: MiddlewareCall) -> Result<MiddlewareResponse, PluginFault> {
+pub async fn handle(
+    handler: Handler,
+    call: MiddlewareCall,
+) -> Result<MiddlewareResponse, PluginFault> {
     #[cfg(test)]
-    eprintln!("[probe] handle entered, model={:?}", call.request.head.model);
+    eprintln!(
+        "[probe] handle entered, model={:?}",
+        call.request.head.model
+    );
     let Handler { config, picker } = handler;
     if call.request.head.mount != MiddlewareMount::Request {
         return call.next.run(call.request).await;
@@ -81,15 +90,23 @@ pub async fn handle(handler: Handler, call: MiddlewareCall) -> Result<Middleware
     let source = match serde_json::from_slice::<Value>(&call.request.body) {
         Ok(Value::Object(source)) => source,
         Ok(_) => {
-            return Ok(error_response(400, "invalid_request", "request body must be a JSON object"));
+            return Ok(error_response(
+                400,
+                "invalid_request",
+                "request body must be a JSON object",
+            ));
         }
         Err(_) => {
-            return Ok(error_response(400, "invalid_request", "request body must be valid JSON"));
+            return Ok(error_response(
+                400,
+                "invalid_request",
+                "request body must be valid JSON",
+            ));
         }
     };
     trace(&call.host, "guard", "request body parsed").await;
-    let prepared = match protocol::prepare_body(&source, &upstream_model, stream) {
-        Ok(body) => body,
+    let prepared = match protocol::prepare_request(&source, &upstream_model, stream) {
+        Ok(prepared) => prepared,
         Err(error) => {
             trace(&call.host, "guard_reject", error.code).await;
             return Ok(protocol_error_response(error));
@@ -98,7 +115,17 @@ pub async fn handle(handler: Handler, call: MiddlewareCall) -> Result<Middleware
     trace(
         &call.host,
         "prepared",
-        if stream { "streaming" } else { "non-streaming" },
+        if stream {
+            if prepared.relay_context().is_some() {
+                "streaming with tool relay"
+            } else {
+                "streaming"
+            }
+        } else if prepared.relay_context().is_some() {
+            "non-streaming with tool relay"
+        } else {
+            "non-streaming"
+        },
     )
     .await;
     proxy(config, picker, call, prepared, stream).await
@@ -108,7 +135,7 @@ async fn proxy(
     config: Arc<RuntimeConfig>,
     picker: Arc<AccountPicker>,
     call: MiddlewareCall,
-    prepared: Vec<u8>,
+    prepared: PreparedRequest,
     stream: bool,
 ) -> Result<MiddlewareResponse, PluginFault> {
     let credential = match picker.select(&call.host).await {
@@ -124,9 +151,14 @@ async fn proxy(
         &credential.chatgpt_account_id,
         stream,
     );
+    let PreparedRequest {
+        body: prepared_body,
+        relay,
+    } = prepared;
     let url = config.responses_url.clone();
     if !stream {
-        let (response, body) = upstream::do_request(&call.host, &url, headers, prepared).await?;
+        let (response, body) =
+            upstream::do_request(&call.host, &url, headers, prepared_body).await?;
         if !(200..300).contains(&response.status) {
             return Ok(upstream_error_response(response.status, &body));
         }
@@ -137,6 +169,16 @@ async fn proxy(
                 "Basis Points response exceeds configured limit",
             ));
         }
+        let body = if let Some(relay) = relay.as_ref() {
+            match transform_json_response(relay, &body) {
+                Ok(body) => body,
+                Err(error) => return Ok(error_response(422, error.code, &error.message)),
+            }
+        } else {
+            // Without a client relay catalog, preserve the upstream body byte
+            // for byte even if it happens to contain tool-shaped JSON.
+            body
+        };
         return Ok(MiddlewareResponse::direct(
             "openai",
             response.status,
@@ -148,10 +190,15 @@ async fn proxy(
         ));
     }
     let stream_response =
-        match upstream::open_stream(&call.host, &url, headers, prepared).await {
+        match upstream::open_stream(&call.host, &url, headers, prepared_body).await {
             Ok(response) => response,
             Err(error) => {
-                trace(&call.host, "open_stream_fault", "managed http stream failed").await;
+                trace(
+                    &call.host,
+                    "open_stream_fault",
+                    "managed http stream failed",
+                )
+                .await;
                 return Err(error);
             }
         };
@@ -171,13 +218,24 @@ async fn proxy(
         .stream
         .clone()
         .ok_or_else(|| upstream::fault("宿主未返回上游流句柄"))?;
-    let (sender, body) =
-        MiddlewareBody::channel(MiddlewareBodyFraming::SseEvent, NonZeroUsize::new(8).unwrap());
+    let (sender, body) = MiddlewareBody::channel(
+        MiddlewareBodyFraming::SseEvent,
+        NonZeroUsize::new(8).unwrap(),
+    );
     let pump_host = call.host.clone();
+    let cancellation = call.cancellation.clone();
     let maximum_bytes = config.max_response_bytes;
     trace(&call.host, "pump_started", "streaming response to client").await;
     tokio::spawn(async move {
-        pump_stream(pump_host, stream_id, sender, maximum_bytes).await;
+        pump_stream(
+            pump_host,
+            stream_id,
+            sender,
+            maximum_bytes,
+            relay,
+            cancellation,
+        )
+        .await;
     });
     Ok(MiddlewareResponse::direct(
         "openai",
@@ -187,57 +245,496 @@ async fn proxy(
     ))
 }
 
-/// 上游 SSE → 中间件输出帧的泵任务；下游取消时宿主回调失败并结束泵。
+/// Pump an upstream SSE stream into the middleware response body.
+///
+/// Relay tool events are held back until the terminal response snapshot is
+/// available. This is intentionally a deterministic pre-commit boundary: text
+/// and non-tool events still stream immediately, while a malformed native relay
+/// can never leak a partial client tool call.
 async fn pump_stream(
     host: gateway_plugin_sdk::client::HostClient,
     stream_id: String,
     sender: gateway_plugin_sdk::client::MiddlewareBodySender,
     maximum_bytes: usize,
+    relay: Option<RelayContext>,
+    cancellation: CallCancellation,
 ) {
+    let active_relay = relay.is_some();
+    let mut delivery = RelaySseDelivery::new(relay);
     let mut splitter = SseFrameSplitter::new();
     let mut delivered = 0usize;
-    let failure: Option<PluginFault> = loop {
-        match upstream::read_stream_chunk(&host, &stream_id).await {
-            Ok((eof, chunk)) => {
-                delivered += chunk.len();
-                if delivered > maximum_bytes {
-                    break Some(upstream::fault("上游响应超过大小上限"));
-                }
-                for frame in splitter.feed(&chunk) {
-                    if frame.done {
-                        continue;
-                    }
-                    if sender.send(MiddlewareBodyFrame::new(frame.bytes, false)).await.is_err() {
-                        // 下游已取消；关闭上游流并退出。
+    let mut stream_failure = None;
+
+    loop {
+        let read = tokio::select! {
+            biased;
+            () = cancellation.cancelled() => {
+                let _ = upstream::close_stream(&host, &stream_id).await;
+                return;
+            }
+            result = upstream::read_stream_chunk(&host, &stream_id) => result,
+        };
+        let (eof, chunk) = match read {
+            Ok(value) => value,
+            Err(error) => {
+                stream_failure = Some(error);
+                break;
+            }
+        };
+        delivered = delivered.saturating_add(chunk.len());
+        if delivered > maximum_bytes {
+            stream_failure = Some(upstream::fault("上游响应超过大小上限"));
+            break;
+        }
+
+        for frame in splitter.feed(&chunk) {
+            match delivery.accept(frame.bytes, frame.done) {
+                Ok(frames) => {
+                    if send_frames(&sender, frames).await.is_err() {
                         let _ = upstream::close_stream(&host, &stream_id).await;
                         return;
                     }
                 }
-                if eof {
-                    let tail = splitter.finish();
-                    if let Some(frame) = tail
-                        && !frame.done
-                        && sender
-                            .send(MiddlewareBodyFrame::new(frame.bytes, false))
-                            .await
-                            .is_err()
-                    {
-                        let _ = upstream::close_stream(&host, &stream_id).await;
-                        return;
+                Err(error) => {
+                    if active_relay {
+                        let _ = send_relay_failure(&sender, delivery.response_id()).await;
+                    } else {
+                        let _ = sender
+                            .fail(relay_error_fault("invalid_sse", &error.message()))
+                            .await;
                     }
-                    break None;
+                    upstream::trace_fault(&host, "relay_stream_failed").await;
+                    let _ = upstream::close_stream(&host, &stream_id).await;
+                    return;
                 }
             }
-            Err(error) => break Some(error),
         }
-    };
-    if let Some(error) = failure {
+        if eof {
+            if let Some(frame) = splitter.finish() {
+                match delivery.accept(frame.bytes, frame.done) {
+                    Ok(frames) => {
+                        if send_frames(&sender, frames).await.is_err() {
+                            let _ = upstream::close_stream(&host, &stream_id).await;
+                            return;
+                        }
+                    }
+                    Err(error) => {
+                        if active_relay {
+                            let _ = send_relay_failure(&sender, delivery.response_id()).await;
+                        } else {
+                            let _ = sender
+                                .fail(relay_error_fault("invalid_sse", &error.message()))
+                                .await;
+                        }
+                        upstream::trace_fault(&host, "relay_stream_failed").await;
+                        let _ = upstream::close_stream(&host, &stream_id).await;
+                        return;
+                    }
+                }
+            }
+            break;
+        }
+    }
+
+    if let Some(error) = stream_failure {
         upstream::trace_fault(&host, "pump_failed").await;
         let _ = sender.fail(error).await;
         let _ = upstream::close_stream(&host, &stream_id).await;
-    } else {
-        upstream::trace_fault(&host, "pump_completed").await;
+        return;
     }
+    match delivery.finish() {
+        Ok(frames) => {
+            if send_frames(&sender, frames).await.is_err() {
+                let _ = upstream::close_stream(&host, &stream_id).await;
+            } else {
+                upstream::trace_fault(&host, "pump_completed").await;
+            }
+        }
+        Err(error) => {
+            if active_relay {
+                let _ = send_relay_failure(&sender, delivery.response_id()).await;
+            } else {
+                let _ = sender
+                    .fail(relay_error_fault("invalid_sse", &error.message()))
+                    .await;
+            }
+            upstream::trace_fault(&host, "relay_terminal_invalid").await;
+            let _ = upstream::close_stream(&host, &stream_id).await;
+        }
+    }
+}
+
+async fn send_frames(
+    sender: &gateway_plugin_sdk::client::MiddlewareBodySender,
+    frames: Vec<Vec<u8>>,
+) -> Result<(), gateway_plugin_sdk::client::SessionError> {
+    for bytes in frames {
+        sender.send(MiddlewareBodyFrame::new(bytes, false)).await?;
+    }
+    Ok(())
+}
+
+/// Semantic SSE delivery state for one prepared relay request.
+///
+/// Native tool lifecycle events are retained only as a validation signal. The
+/// terminal response snapshot is the source of truth for client-shaped events,
+/// so a partial or malformed native call cannot reach the client.
+struct RelaySseDelivery {
+    context: Option<RelayContext>,
+    active: bool,
+    tool_events_seen: bool,
+    terminal_seen: bool,
+    done_seen: bool,
+    response_id: Option<String>,
+    tracker: SseStreamTracker,
+}
+
+impl RelaySseDelivery {
+    fn new(context: Option<RelayContext>) -> Self {
+        let active = context.is_some();
+        Self {
+            active,
+            context,
+            tool_events_seen: false,
+            terminal_seen: false,
+            done_seen: false,
+            response_id: None,
+            tracker: SseStreamTracker::new(),
+        }
+    }
+
+    fn response_id(&self) -> Option<&str> {
+        self.response_id.as_deref()
+    }
+
+    fn accept(
+        &mut self,
+        bytes: Vec<u8>,
+        done_frame: bool,
+    ) -> Result<Vec<Vec<u8>>, RelayDeliveryError> {
+        if done_frame {
+            self.done_seen = true;
+            return Ok(Vec::new());
+        }
+        if !self.active {
+            return Ok(vec![bytes]);
+        }
+
+        let event = match sse::parse_sse_json_event(&bytes) {
+            Ok(Some(event)) => event,
+            Ok(None) => return Ok(vec![bytes]),
+            Err(_) => {
+                // Unknown/non-JSON provider frames remain opaque. They are not
+                // interpreted as relay events and cannot manufacture a tool call.
+                return Ok(vec![bytes]);
+            }
+        };
+        self.tracker.observe_json(&event);
+        if let Some(response_id) = event_response_id(&event) {
+            self.response_id = Some(response_id);
+        }
+
+        let Some(event_type) = event.event_type() else {
+            return Ok(vec![bytes]);
+        };
+        if is_native_tool_event(event_type, event.value()) {
+            self.tool_events_seen = true;
+            return Ok(Vec::new());
+        }
+        if !sse::is_terminal_event(event_type) {
+            return Ok(vec![bytes]);
+        }
+
+        self.terminal_seen = true;
+        validate_terminal_event(event_type, &event)?;
+        if matches!(
+            event_type,
+            "response.failed" | "error" | "response.cancelled" | "response.canceled"
+        ) {
+            // Upstream failure is already a complete response. Never replay a
+            // partial native call after a failed response.
+            self.tool_events_seen = false;
+            return Ok(vec![bytes]);
+        }
+        if !matches!(
+            event_type,
+            "response.completed" | "response.done" | "response.incomplete"
+        ) {
+            return Ok(vec![bytes]);
+        }
+
+        let response = event.value().get("response").unwrap_or(event.value());
+        if !response.is_object() {
+            return Err(RelayDeliveryError::InvalidTerminal);
+        }
+        let transformed = self
+            .context
+            .as_ref()
+            .ok_or(RelayDeliveryError::InvalidTerminal)?
+            .transform_response(response)
+            .map_err(RelayDeliveryError::Relay)?;
+        if !transformed.changed {
+            if self.tool_events_seen {
+                return Err(RelayDeliveryError::ToolEventsWithoutTransformedCall);
+            }
+            return Ok(vec![bytes]);
+        }
+
+        let transformed_response = transformed.response;
+        let terminal = if event.value().get("response").is_some() {
+            let mut envelope = event
+                .value()
+                .as_object()
+                .cloned()
+                .ok_or(RelayDeliveryError::InvalidTerminal)?;
+            envelope.insert("response".to_owned(), transformed_response.clone());
+            Value::Object(envelope)
+        } else {
+            transformed_response.clone()
+        };
+        let response_id = transformed_response
+            .get("id")
+            .and_then(Value::as_str)
+            .or(self.response_id.as_deref());
+        let mut output = client_tool_event_frames(&transformed_response, response_id);
+        output.push(encode_sse_frame(event_type, &terminal));
+        self.tool_events_seen = false;
+        Ok(output)
+    }
+
+    fn finish(&self) -> Result<Vec<Vec<u8>>, RelayDeliveryError> {
+        if self.active && (!self.terminal_seen || !self.done_seen) {
+            return Err(RelayDeliveryError::MissingTerminal);
+        }
+        Ok(Vec::new())
+    }
+}
+
+#[derive(Debug)]
+enum RelayDeliveryError {
+    Relay(RelayError),
+    InvalidTerminal,
+    MissingTerminal,
+    ToolEventsWithoutTransformedCall,
+}
+
+impl RelayDeliveryError {
+    fn message(&self) -> String {
+        match self {
+            Self::Relay(error) => error.message.clone(),
+            Self::InvalidTerminal => {
+                "Basis Points returned an invalid response terminal".to_owned()
+            }
+            Self::MissingTerminal => {
+                "Basis Points response stream ended without a terminal event".to_owned()
+            }
+            Self::ToolEventsWithoutTransformedCall => {
+                "Basis Points returned tool events without a valid client tool call".to_owned()
+            }
+        }
+    }
+}
+
+fn is_native_tool_event(event_type: &str, value: &Value) -> bool {
+    match event_type {
+        "response.output_item.added" | "response.output_item.done" => value
+            .get("item")
+            .and_then(Value::as_object)
+            .and_then(|item| item.get("type"))
+            .and_then(Value::as_str)
+            .is_some_and(|kind| matches!(kind, "function_call" | "custom_tool_call")),
+        "response.function_call_arguments.delta"
+        | "response.function_call_arguments.done"
+        | "response.custom_tool_call_input.delta"
+        | "response.custom_tool_call_input.done" => true,
+        _ => false,
+    }
+}
+
+fn event_response_id(event: &SseJsonEvent) -> Option<String> {
+    event
+        .value()
+        .pointer("/response/id")
+        .and_then(Value::as_str)
+        .or_else(|| event.value().get("response_id").and_then(Value::as_str))
+        .filter(|id| !id.is_empty())
+        .map(str::to_owned)
+}
+
+fn validate_terminal_event(
+    event_type: &str,
+    event: &SseJsonEvent,
+) -> Result<(), RelayDeliveryError> {
+    let status = sse::sse_event_status(event);
+    let valid = match event_type {
+        "response.completed" => status.is_none_or(|status| status == "completed"),
+        "response.incomplete" => status.is_none_or(|status| status == "incomplete"),
+        "response.failed" | "error" => status.is_none_or(|status| status == "failed"),
+        "response.cancelled" | "response.canceled" => {
+            status.is_none_or(|status| matches!(status, "cancelled" | "canceled"))
+        }
+        "response.done" => true,
+        _ => true,
+    };
+    valid
+        .then_some(())
+        .ok_or(RelayDeliveryError::InvalidTerminal)
+}
+
+fn client_tool_event_frames(response: &Value, response_id: Option<&str>) -> Vec<Vec<u8>> {
+    let Some(output) = response.get("output").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    let mut frames = Vec::new();
+    for (output_index, item) in output.iter().enumerate() {
+        let Some(object) = item.as_object() else {
+            continue;
+        };
+        let Some(kind) = object.get("type").and_then(Value::as_str) else {
+            continue;
+        };
+        if !matches!(kind, "function_call" | "custom_tool_call") {
+            continue;
+        }
+        let mut added = Map::new();
+        added.insert(
+            "type".to_owned(),
+            Value::String("response.output_item.added".to_owned()),
+        );
+        if let Some(response_id) = response_id {
+            added.insert(
+                "response_id".to_owned(),
+                Value::String(response_id.to_owned()),
+            );
+        }
+        added.insert(
+            "output_index".to_owned(),
+            Value::Number(serde_json::Number::from(output_index)),
+        );
+        added.insert("item".to_owned(), item.clone());
+        frames.push(encode_sse_frame(
+            "response.output_item.added",
+            &Value::Object(added),
+        ));
+
+        let event_type = if kind == "custom_tool_call" {
+            "response.custom_tool_call_input.done"
+        } else {
+            "response.function_call_arguments.done"
+        };
+        let mut arguments = Map::new();
+        arguments.insert("type".to_owned(), Value::String(event_type.to_owned()));
+        if let Some(response_id) = response_id {
+            arguments.insert(
+                "response_id".to_owned(),
+                Value::String(response_id.to_owned()),
+            );
+        }
+        arguments.insert(
+            "output_index".to_owned(),
+            Value::Number(serde_json::Number::from(output_index)),
+        );
+        if let Some(id) = object.get("id") {
+            arguments.insert("item_id".to_owned(), id.clone());
+        }
+        if let Some(call_id) = object.get("call_id") {
+            arguments.insert("call_id".to_owned(), call_id.clone());
+        }
+        if kind == "custom_tool_call" {
+            arguments.insert(
+                "input".to_owned(),
+                object
+                    .get("input")
+                    .cloned()
+                    .unwrap_or_else(|| Value::String(String::new())),
+            );
+        } else {
+            arguments.insert(
+                "arguments".to_owned(),
+                object
+                    .get("arguments")
+                    .cloned()
+                    .unwrap_or_else(|| Value::String(String::new())),
+            );
+        }
+        frames.push(encode_sse_frame(event_type, &Value::Object(arguments)));
+
+        let mut done = Map::new();
+        done.insert(
+            "type".to_owned(),
+            Value::String("response.output_item.done".to_owned()),
+        );
+        if let Some(response_id) = response_id {
+            done.insert(
+                "response_id".to_owned(),
+                Value::String(response_id.to_owned()),
+            );
+        }
+        done.insert(
+            "output_index".to_owned(),
+            Value::Number(serde_json::Number::from(output_index)),
+        );
+        done.insert("item".to_owned(), item.clone());
+        frames.push(encode_sse_frame(
+            "response.output_item.done",
+            &Value::Object(done),
+        ));
+    }
+    frames
+}
+
+fn encode_sse_frame(event_type: &str, value: &Value) -> Vec<u8> {
+    let data = serde_json::to_string(value).unwrap_or_else(|_| "{}".to_owned());
+    format!("event: {event_type}\ndata: {data}\n\n").into_bytes()
+}
+
+async fn send_relay_failure(
+    sender: &gateway_plugin_sdk::client::MiddlewareBodySender,
+    response_id: Option<&str>,
+) -> Result<(), gateway_plugin_sdk::client::SessionError> {
+    let response = json!({
+        "id": response_id.unwrap_or("resp_relay_error"),
+        "status": "failed",
+        "output": [],
+        "error": {
+            "type": "invalid_request_error",
+            "code": "relay_error",
+            "message": "Basis Points returned an invalid client tool relay."
+        }
+    });
+    let event = json!({"type": "response.failed", "response": response});
+    sender
+        .send(MiddlewareBodyFrame::new(
+            encode_sse_frame("response.failed", &event),
+            false,
+        ))
+        .await
+}
+
+fn transform_json_response(relay: &RelayContext, body: &[u8]) -> Result<Vec<u8>, RelayError> {
+    let response = serde_json::from_slice::<Value>(body).map_err(|_| RelayError {
+        status: 502,
+        code: "invalid_upstream_response",
+        message: "Basis Points returned invalid JSON".to_owned(),
+    })?;
+    let transformed = relay.transform_response(&response)?;
+    if transformed.changed {
+        serde_json::to_vec(&transformed.response).map_err(|_| RelayError {
+            status: 502,
+            code: "relay_encoding_failed",
+            message: "client tool relay response could not be encoded".to_owned(),
+        })
+    } else {
+        // Preserve non-tool responses byte-for-byte, including unknown fields.
+        Ok(body.to_vec())
+    }
+}
+
+fn relay_error_fault(code: &str, message: &str) -> PluginFault {
+    PluginFault::new(
+        gateway_plugin_sdk::ErrorCode::Fault,
+        format!("client tool relay failed ({code}): {message}"),
+    )
 }
 
 fn protocol_error_response(error: ProtocolError) -> MiddlewareResponse {
@@ -256,7 +753,11 @@ fn redact(text: String) -> String {
     let mut result = String::with_capacity(text.len());
     let mut token = String::new();
     for character in text.chars() {
-        if character.is_ascii_alphanumeric() || character == '.' || character == '-' || character == '_' {
+        if character.is_ascii_alphanumeric()
+            || character == '.'
+            || character == '-'
+            || character == '_'
+        {
             token.push(character);
         } else {
             flush_token(&mut result, &mut token);

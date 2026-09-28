@@ -117,7 +117,14 @@ fn find_access_token(material: &serde_json::Map<String, Value>) -> Option<String
             return Some(token.to_owned());
         }
     }
-    for key in ["tokens", "token_data", "tokenData", "oauth", "sessionInfo", "session_info"] {
+    for key in [
+        "tokens",
+        "token_data",
+        "tokenData",
+        "oauth",
+        "sessionInfo",
+        "session_info",
+    ] {
         if let Some(nested) = material.get(key).and_then(Value::as_object)
             && let Some(token) = find_access_token(nested)
         {
@@ -144,8 +151,12 @@ fn find_account_id(
             return Some(id.trim().to_owned());
         }
     }
-    jwt_claim(access_token, "https://api.openai.com/auth", "chatgpt_account_id")
-        .or_else(|| jwt_claim(access_token, "", "chatgpt_account_id"))
+    jwt_claim(
+        access_token,
+        "https://api.openai.com/auth",
+        "chatgpt_account_id",
+    )
+    .or_else(|| jwt_claim(access_token, "", "chatgpt_account_id"))
 }
 
 fn jwt_claim(token: &str, outer_key: &str, claim: &str) -> Option<String> {

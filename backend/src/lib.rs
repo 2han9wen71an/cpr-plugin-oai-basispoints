@@ -8,6 +8,7 @@ mod catalog;
 pub mod config;
 mod middleware;
 pub mod protocol;
+pub mod relay;
 pub mod sse;
 mod upstream;
 

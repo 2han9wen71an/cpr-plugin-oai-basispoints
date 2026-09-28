@@ -23,7 +23,10 @@ struct HostPeer {
 async fn start_session(
     handler: gateway_plugin_sdk::client::ComposedPlugin,
     contributes: gateway_plugin_sdk::Contributions,
-) -> (HostPeer, JoinHandle<Result<(), gateway_plugin_sdk::client::SessionError>>) {
+) -> (
+    HostPeer,
+    JoinHandle<Result<(), gateway_plugin_sdk::client::SessionError>>,
+) {
     let (host, plugin_side) = tokio::io::duplex(MAXIMUM_STREAM_CHUNK_BYTES * 2);
     let (plugin_reader, plugin_writer) = tokio::io::split(plugin_side);
     let task = tokio::spawn(async move {
@@ -82,7 +85,14 @@ async fn start_session(
     (HostPeer { reader, writer }, task)
 }
 
-async fn send_call(host: &mut HostPeer, id: u64, method: &str, stage: Stage, params: Value, payload: Vec<u8>) {
+async fn send_call(
+    host: &mut HostPeer,
+    id: u64,
+    method: &str,
+    stage: Stage,
+    params: Value,
+    payload: Vec<u8>,
+) {
     write_frame(
         &mut host.writer,
         &Frame {
@@ -170,14 +180,21 @@ async fn run_guard_case(body: Value) -> Result<MiddlewareResponseHead, String> {
                 reply_callback(&mut host, id).await;
             }
             Message::Result { id: 1, result } => {
-                eprintln!("[probe] Result JSON: {}", serde_json::to_string(&result).unwrap());
+                eprintln!(
+                    "[probe] Result JSON: {}",
+                    serde_json::to_string(&result).unwrap()
+                );
                 outcome = Ok(serde_json::from_value(result).unwrap());
             }
             Message::Error { id: 1, error } => {
                 outcome = Err(serde_json::to_string(&error).unwrap());
             }
             Message::Stream { id: 1, .. } => {
-                eprintln!("[probe] Stream payload len={}, bytes={:?}", frame.payload.len(), &frame.payload[..frame.payload.len().min(32)]);
+                eprintln!(
+                    "[probe] Stream payload len={}, bytes={:?}",
+                    frame.payload.len(),
+                    &frame.payload[..frame.payload.len().min(32)]
+                );
             }
             Message::End { id: 1, .. } => break,
             unexpected => panic!("unexpected frame: {unexpected:?}"),
@@ -291,11 +308,11 @@ async fn unknown_model_passes_through_via_next() {
             unexpected => panic!("unexpected frame: {unexpected:?}"),
         }
     }
-    assert!(saw_next, "plugin must pass non-alias models through to next");
-    let _ = write_frame(
-        &mut host.writer,
-        &Frame::control(Message::Shutdown),
-    )
-    .await;
-    let _ = task;
+    assert!(
+        saw_next,
+        "plugin must pass non-alias models through to next"
+    );
+    let _ = write_frame(&mut host.writer, &Frame::control(Message::Shutdown)).await;
+    task.abort();
+    let _ = task.await;
 }

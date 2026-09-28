@@ -1,3 +1,4 @@
+use crate::relay;
 use serde_json::{Map, Value};
 use sha1::Sha1;
 use sha2::{Digest, Sha256};
@@ -20,14 +21,78 @@ impl ProtocolError {
     }
 }
 
-/// 复刻 CPA 插件 `prepareResponsesBody` 的最小请求合同：守卫、模型映射、
-/// reasoning effort、开发者序言、task/turn 标识。工具中继协议在 v0.1 尚未移植，
-/// 携带工具的请求会被显式拒绝而不是静默丢弃。
-pub fn prepare_body(
+/// 请求发送给上游前的完整准备结果。
+///
+/// `body` 是可直接交给上游 HTTP 客户端的 JSON 字节；当请求包含工具目录
+/// 或需要重放的工具历史时，`relay` 携带同一轮响应转换所需的上下文。
+#[derive(Debug, Clone)]
+pub struct PreparedRequest {
+    pub body: Vec<u8>,
+    pub relay: Option<relay::RelayContext>,
+}
+
+impl PreparedRequest {
+    /// Borrows the encoded upstream request body.
+    #[must_use]
+    pub fn body_bytes(&self) -> &[u8] {
+        &self.body
+    }
+
+    /// Borrows the relay context, when this request uses tool relay.
+    #[must_use]
+    pub fn relay_context(&self) -> Option<&relay::RelayContext> {
+        self.relay.as_ref()
+    }
+
+    /// Consumes the preparation result and returns its encoded body.
+    #[must_use]
+    pub fn into_body(self) -> Vec<u8> {
+        self.body
+    }
+}
+
+/// Backwards-compatible name for callers that model the prepared payload as a body.
+pub type PreparedBody = PreparedRequest;
+
+fn relay_error(error: relay::RelayError) -> ProtocolError {
+    ProtocolError::new(error.status, error.code, error.message)
+}
+
+fn relay_requested(source: &Map<String, Value>) -> bool {
+    source.get("tools").is_some_and(|value| {
+        !value.is_null() && value.as_array().is_none_or(|tools| !tools.is_empty())
+    }) || source
+        .get("input")
+        .and_then(Value::as_array)
+        .is_some_and(|items| {
+            items.iter().any(|item| {
+                item.as_object()
+                    .and_then(|object| object.get("type"))
+                    .and_then(Value::as_str)
+                    .is_some_and(|kind| {
+                        kind.eq_ignore_ascii_case("additional_tools")
+                            || kind.eq_ignore_ascii_case("function_call")
+                            || kind.eq_ignore_ascii_case("custom_tool_call")
+                            || kind.eq_ignore_ascii_case("function_call_output")
+                            || kind.eq_ignore_ascii_case("custom_tool_call_output")
+                    })
+            })
+        })
+        || source
+            .get("tool_choice")
+            .is_some_and(|value| !value.is_null())
+        || source
+            .get("parallel_tool_calls")
+            .is_some_and(|value| !value.is_null())
+}
+
+/// Prepares a request body and, for relay requests, returns the context needed to
+/// transform the matching upstream response.
+pub fn prepare_request(
     source: &Map<String, Value>,
     upstream_model: &str,
     stream: bool,
-) -> Result<Vec<u8>, ProtocolError> {
+) -> Result<PreparedRequest, ProtocolError> {
     if source
         .get("previous_response_id")
         .is_some_and(|value| !value.is_null())
@@ -49,32 +114,55 @@ pub fn prepare_body(
         }
     }
     validate_text_format(source.get("text"))?;
-    if source.get("tools").and_then(Value::as_array).is_some_and(|tools| !tools.is_empty())
-        || source.get("tool_choice").is_some_and(|value| !value.is_null())
-    {
-        return Err(ProtocolError::new(
-            400,
-            "unsupported_tools",
-            "oai-basispoints v0.1 does not implement the client tool relay protocol; omit tools and tool_choice",
-        ));
-    }
-    let mut input_items = translate_input(source.get("input"));
+
+    // The relay owns tool directory validation, developer prologue generation,
+    // and history rewriting. Keep the legacy translator on an ordinary request
+    // so no-tools requests retain their established wire shape byte-for-byte
+    // (including the existing reference/reasoning filtering behavior).
+    let (mut input_items, developer_instructions, relay_context) = if relay_requested(source) {
+        let prepared_relay = relay::prepare_source(source).map_err(relay_error)?;
+        let relay::PreparedRelay {
+            input,
+            developer_instructions,
+            context,
+        } = prepared_relay;
+        (
+            input,
+            developer_instructions,
+            context.is_active().then_some(context),
+        )
+    } else {
+        (translate_input(source.get("input")), None, None)
+    };
+
     // 会话指纹按序言注入前的翻译结果计算，与 CPA 插件一致。
     let history_fingerprint = conversation_fingerprint(&input_items);
+    let mut prologue = Vec::with_capacity(2);
     if let Some(instructions) = source
         .get("instructions")
         .and_then(Value::as_str)
         .map(str::trim)
         .filter(|text| !text.is_empty())
     {
-        input_items.insert(0, message_item("developer", instructions));
+        prologue.push(message_item("developer", instructions));
     }
+    if let Some(instructions) = developer_instructions {
+        prologue.push(message_item("developer", &instructions));
+    }
+    if !prologue.is_empty() {
+        prologue.extend(input_items);
+        input_items = prologue;
+    }
+
     let mut output = Map::new();
     output.insert("model".to_owned(), Value::String(upstream_model.to_owned()));
-    output.insert("model_selection".to_owned(), Value::String("explicit".to_owned()));
+    output.insert(
+        "model_selection".to_owned(),
+        Value::String("explicit".to_owned()),
+    );
     output.insert("stream".to_owned(), Value::Bool(stream));
     output.insert("store".to_owned(), Value::Bool(false));
-    output.insert("input".to_owned(), Value::Array(input_items.clone()));
+    output.insert("input".to_owned(), Value::Array(input_items));
     output.insert(
         "reasoning_effort".to_owned(),
         Value::String(reasoning_effort(source)),
@@ -103,14 +191,16 @@ pub fn prepare_body(
                     metadata.insert(trim_key(key), Value::String(truncate(text, 512)));
                 }
                 Value::Number(_) | Value::Bool(_) => {
-                    metadata.insert(trim_key(key), Value::String(truncate(&value.to_string(), 512)));
+                    metadata.insert(
+                        trim_key(key),
+                        Value::String(truncate(&value.to_string(), 512)),
+                    );
                 }
                 _ => {}
             }
         }
     }
-    let conversation =
-        explicit_conversation_key(source).unwrap_or_else(|| history_fingerprint);
+    let conversation = explicit_conversation_key(source).unwrap_or(history_fingerprint);
     let (turn_fingerprint, iteration) = turn_state(source.get("input"));
     metadata.insert(
         "task_id".to_owned(),
@@ -127,8 +217,30 @@ pub fn prepare_body(
         Value::String(iteration.to_string()),
     );
     output.insert("metadata".to_owned(), Value::Object(metadata));
-    serde_json::to_vec(&Value::Object(output))
-        .map_err(|_| ProtocolError::new(500, "plugin_error", "请求编码失败"))
+    let body = serde_json::to_vec(&Value::Object(output))
+        .map_err(|_| ProtocolError::new(500, "plugin_error", "请求编码失败"))?;
+    Ok(PreparedRequest {
+        body,
+        relay: relay_context,
+    })
+}
+
+/// Compatibility wrapper used by the current middleware and existing callers.
+pub fn prepare_body(
+    source: &Map<String, Value>,
+    upstream_model: &str,
+    stream: bool,
+) -> Result<Vec<u8>, ProtocolError> {
+    Ok(prepare_request(source, upstream_model, stream)?.body)
+}
+
+/// Alias for adapters that prefer an explicitly relay-aware name.
+pub fn prepare_body_with_relay(
+    source: &Map<String, Value>,
+    upstream_model: &str,
+    stream: bool,
+) -> Result<PreparedRequest, ProtocolError> {
+    prepare_request(source, upstream_model, stream)
 }
 
 fn validate_text_format(value: Option<&Value>) -> Result<(), ProtocolError> {
@@ -136,13 +248,21 @@ fn validate_text_format(value: Option<&Value>) -> Result<(), ProtocolError> {
         return Ok(());
     };
     let Some(text) = text.as_object() else {
-        return Err(ProtocolError::new(400, "invalid_text_config", "text must be an object"));
+        return Err(ProtocolError::new(
+            400,
+            "invalid_text_config",
+            "text must be an object",
+        ));
     };
     let Some(format) = text.get("format") else {
         return Ok(());
     };
     let Some(format) = format.as_object() else {
-        return Err(ProtocolError::new(400, "invalid_text_format", "text.format must be an object"));
+        return Err(ProtocolError::new(
+            400,
+            "invalid_text_format",
+            "text.format must be an object",
+        ));
     };
     match format.get("type").and_then(Value::as_str) {
         Some("text") => {
@@ -181,7 +301,10 @@ fn normalize_effort(value: Option<&Value>) -> String {
         "x-high" | "extra-high" | "extra_high" | "max" => "xhigh".to_owned(),
         other => other.to_owned(),
     };
-    if matches!(normalized.as_str(), "low" | "medium" | "high" | "xhigh" | "ultra") {
+    if matches!(
+        normalized.as_str(),
+        "low" | "medium" | "high" | "xhigh" | "ultra"
+    ) {
         return normalized;
     }
     "medium".to_owned()
@@ -239,7 +362,12 @@ fn message_item(role: &str, text: &str) -> Value {
 }
 
 fn explicit_conversation_key(source: &Map<String, Value>) -> Option<String> {
-    for key in ["prompt_cache_key", "promptCacheKey", "session_id", "sessionId"] {
+    for key in [
+        "prompt_cache_key",
+        "promptCacheKey",
+        "session_id",
+        "sessionId",
+    ] {
         if let Some(value) = source.get(key).and_then(Value::as_str)
             && !value.trim().is_empty()
         {
@@ -303,9 +431,7 @@ fn turn_state(raw: Option<&Value>) -> (String, u32) {
             .as_object()
             .and_then(|object| object.get("type"))
             .and_then(Value::as_str)
-            .is_some_and(|kind| {
-                matches!(kind, "function_call_output" | "custom_tool_call_output")
-            })
+            .is_some_and(|kind| matches!(kind, "function_call_output" | "custom_tool_call_output"))
         {
             iteration += 1;
         }

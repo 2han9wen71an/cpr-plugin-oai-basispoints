@@ -1,5 +1,5 @@
 use cpr_plugin_oai_basispoints::config::RuntimeConfig;
-use cpr_plugin_oai_basispoints::protocol::prepare_body;
+use cpr_plugin_oai_basispoints::protocol::{prepare_body, prepare_request};
 use cpr_plugin_oai_basispoints::sse::SseFrameSplitter;
 use serde_json::{Value, json};
 
@@ -62,7 +62,10 @@ fn prepare_maps_model_and_rejects_continuation() {
     let error = prepare_body(&source, "gpt-6-astra", false).unwrap_err();
     assert_eq!(error.status, 400);
     assert_eq!(error.code, "unsupported_continuation");
-    assert_eq!(config.resolve_upstream("gpt-6-astra-basispoints"), Some("gpt-6-astra"));
+    assert_eq!(
+        config.resolve_upstream("gpt-6-astra-basispoints"),
+        Some("gpt-6-astra")
+    );
 }
 
 #[test]
@@ -98,24 +101,88 @@ fn prepare_builds_standard_chat_body_with_turn_metadata() {
 }
 
 #[test]
-fn prepare_rejects_tools_service_tier_and_text_format() {
+fn prepare_accepts_relay_tools_and_preserves_guards() {
+    let mut source = json!({
+        "input": "hi",
+        "tools": [{
+            "type": "function",
+            "name": "exec",
+            "description": "Run a command",
+            "parameters": {"type": "object", "properties": {"cmd": {"type": "string"}}}
+        }],
+        "tool_choice": "auto"
+    })
+    .as_object()
+    .unwrap()
+    .clone();
+    let prepared = prepare_request(&source, "gpt-6-astra", false).unwrap();
+    let body: Value = serde_json::from_slice(&prepared.body).unwrap();
+    assert!(prepared.relay.is_some());
+    assert!(body.get("tools").is_none());
+    assert_eq!(body["input"][0]["role"], "developer");
+    assert!(
+        body["input"][0]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("run_officejs")
+    );
+    assert_eq!(body["input"][1]["role"], "user");
+
     for (extra, code) in [
-        (json!({"tools": [{"type": "function", "name": "x"}]}), "unsupported_tools"),
-        (json!({"tool_choice": "auto"}), "unsupported_tools"),
-        (json!({"service_tier": "priority"}), "unsupported_service_tier"),
+        (
+            json!({"service_tier": "priority"}),
+            "unsupported_service_tier",
+        ),
         (
             json!({"text": {"format": {"type": "json_object"}}}),
             "unsupported_text_format",
         ),
     ] {
-        let mut source = json!({"input": "hi"}).as_object().unwrap().clone();
         for (key, value) in extra.as_object().unwrap() {
             source.insert(key.clone(), value.clone());
         }
         let error = prepare_body(&source, "gpt-6-astra", false).unwrap_err();
         assert_eq!(error.code, code, "case {code}");
         assert_eq!(error.status, 400);
+        for key in extra.as_object().unwrap().keys() {
+            source.remove(key);
+        }
     }
+}
+
+#[test]
+fn prepare_treats_empty_tools_and_null_choice_as_no_relay() {
+    let source = json!({"input": "hi", "tools": [], "tool_choice": null})
+        .as_object()
+        .unwrap()
+        .clone();
+    let prepared = prepare_request(&source, "gpt-6-astra", false).unwrap();
+    let body: Value = serde_json::from_slice(&prepared.body).unwrap();
+    assert!(prepared.relay.is_none());
+    assert_eq!(body["input"].as_array().unwrap().len(), 1);
+    assert_eq!(body["input"][0]["role"], "user");
+}
+
+#[test]
+fn prepare_relay_rejects_invalid_tool_directory_and_continuation() {
+    let source = json!({
+        "input": "hi",
+        "tools": [{"type": "function"}]
+    })
+    .as_object()
+    .unwrap()
+    .clone();
+    let error = prepare_body(&source, "gpt-6-astra", false).unwrap_err();
+    assert_eq!(error.code, "invalid_tool_directory");
+    assert_eq!(error.status, 400);
+
+    let source = json!({"input": "hi", "previous_response_id": "resp_123"})
+        .as_object()
+        .unwrap()
+        .clone();
+    let error = prepare_body(&source, "gpt-6-astra", false).unwrap_err();
+    assert_eq!(error.code, "unsupported_continuation");
+    assert_eq!(error.status, 400);
 }
 
 #[test]
@@ -160,10 +227,8 @@ fn turn_iteration_counts_tool_outputs_after_last_user() {
         serde_json::from_slice(&prepare_body(&source, "gpt-6-astra", false).unwrap()).unwrap();
     assert_eq!(body["metadata"]["agent_iteration"], "2");
     // 相同用户 turn 前缀产生稳定 turn_id。
-    let again: Value = serde_json::from_slice(
-        &prepare_body(&source, "gpt-6-astra", false).unwrap(),
-    )
-    .unwrap();
+    let again: Value =
+        serde_json::from_slice(&prepare_body(&source, "gpt-6-astra", false).unwrap()).unwrap();
     assert_eq!(body["metadata"]["turn_id"], again["metadata"]["turn_id"]);
 }
 
@@ -174,11 +239,17 @@ fn sse_splitter_emits_complete_frames_and_marks_done() {
         b"event: response.created\ndata: {\"a\":1}\n\nevent: response.output_text.delta\ndata: {\"b\":",
     );
     assert_eq!(frames.len(), 1);
-    assert_eq!(frames.remove(0).bytes, b"event: response.created\ndata: {\"a\":1}\n\n");
+    assert_eq!(
+        frames.remove(0).bytes,
+        b"event: response.created\ndata: {\"a\":1}\n\n"
+    );
     frames.extend(splitter.feed(b"2}\n\n"));
     assert_eq!(frames.len(), 1);
     let second = frames.remove(0);
-    assert_eq!(second.bytes, b"event: response.output_text.delta\ndata: {\"b\":2}\n\n");
+    assert_eq!(
+        second.bytes,
+        b"event: response.output_text.delta\ndata: {\"b\":2}\n\n"
+    );
     assert!(!second.done);
     frames.extend(splitter.feed(b"data: [DONE]\n"));
     assert!(frames.is_empty());
