@@ -288,18 +288,27 @@ async fn pump_stream(
         }
 
         for frame in splitter.feed(&chunk) {
-            match delivery.accept(frame.bytes, frame.done) {
+            let done = frame.done;
+            match delivery.accept(frame.bytes, done) {
                 Ok(frames) => {
                     if send_frames(&sender, frames).await.is_err() {
+                        let _ = upstream::close_stream(&host, &stream_id).await;
+                        return;
+                    }
+                    if done {
+                        let _ = sender
+                            .send(MiddlewareBodyFrame::new(Vec::new(), true))
+                            .await;
                         let _ = upstream::close_stream(&host, &stream_id).await;
                         return;
                     }
                 }
                 Err(error) => {
                     if active_relay {
+                        upstream::trace_fault(&host, relay_error_step(&error)).await;
                         let _ = send_relay_failure(&sender, delivery.response_id()).await;
                         let _ = sender
-                            .send(MiddlewareBodyFrame::new(b"data: [DONE]\n\n".to_vec(), true))
+                            .send(MiddlewareBodyFrame::new(Vec::new(), true))
                             .await;
                     } else {
                         let _ = sender
@@ -325,7 +334,7 @@ async fn pump_stream(
                         if active_relay {
                             let _ = send_relay_failure(&sender, delivery.response_id()).await;
                             let _ = sender
-                                .send(MiddlewareBodyFrame::new(b"data: [DONE]\n\n".to_vec(), true))
+                                .send(MiddlewareBodyFrame::new(Vec::new(), true))
                                 .await;
                         } else {
                             let _ = sender
@@ -421,17 +430,19 @@ impl RelaySseDelivery {
         bytes: Vec<u8>,
         done_frame: bool,
     ) -> Result<Vec<Vec<u8>>, RelayDeliveryError> {
-        if !self.active {
-            // Preserve the legacy no-relay path exactly, including dropping the
-            // upstream [DONE] control frame.
-            return Ok(if done_frame { Vec::new() } else { vec![bytes] });
-        }
         if done_frame {
+            if !self.active {
+                return Ok(Vec::new());
+            }
             if !self.terminal_seen {
                 return Err(RelayDeliveryError::MissingTerminal);
             }
             self.done_seen = true;
+            // The pump maps this control frame to the SDK terminal bit.
             return Ok(Vec::new());
+        }
+        if !self.active {
+            return Ok(vec![bytes]);
         }
         if self.terminal_seen || self.done_seen {
             return Err(RelayDeliveryError::EventsAfterTerminal);
@@ -553,6 +564,16 @@ impl RelayDeliveryError {
                 "Basis Points returned events after the terminal event".to_owned()
             }
         }
+    }
+}
+
+fn relay_error_step(error: &RelayDeliveryError) -> &'static str {
+    match error {
+        RelayDeliveryError::Relay(_) => "relay_invalid_tool_call",
+        RelayDeliveryError::InvalidTerminal => "relay_invalid_terminal",
+        RelayDeliveryError::MissingTerminal => "relay_missing_terminal",
+        RelayDeliveryError::ToolEventsWithoutTransformedCall => "relay_tool_without_call",
+        RelayDeliveryError::EventsAfterTerminal => "relay_events_after_terminal",
     }
 }
 
