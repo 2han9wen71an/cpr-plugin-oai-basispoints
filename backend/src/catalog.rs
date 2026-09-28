@@ -10,10 +10,17 @@ pub fn registration(config: &RuntimeConfig) -> ModelCatalogRegistration {
         models: config
             .models
             .iter()
-            .map(|model| ModelAlias {
-                id: model.alias.clone(),
-                provider: "openai".to_owned(),
-                model: config.catalog_target.clone(),
+            .map(|model| {
+                let target = if !model.upstream_model.trim().is_empty() {
+                    model.upstream_model.trim().to_owned()
+                } else {
+                    config.catalog_target.clone()
+                };
+                ModelAlias {
+                    id: model.alias.clone(),
+                    provider: "openai".to_owned(),
+                    model: target,
+                }
             })
             .collect(),
     }
