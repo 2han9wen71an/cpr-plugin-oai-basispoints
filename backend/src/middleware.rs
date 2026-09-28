@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use gateway_plugin_sdk::{
     PluginFault,
-    call::middleware::{MiddlewareBodyFrame, MiddlewareBodyFraming, MiddlewareHeader, MiddlewareMount},
+    call::middleware::{MiddlewareBodyFrame, MiddlewareBodyFraming, MiddlewareMount},
     client::{MiddlewareBody, MiddlewareCall, MiddlewareResponse},
 };
 use serde_json::{Value, json};
@@ -21,7 +21,22 @@ pub struct Handler {
     pub picker: Arc<AccountPicker>,
 }
 
+/// 关键步骤经 host.log 留痕（事件名固定前缀，字段不含凭据与正文）。
+async fn trace(host: &gateway_plugin_sdk::client::HostClient, step: &str, detail: &str) {
+    let request = gateway_plugin_sdk::call::host::LogRequest {
+        event: format!("oai-basispoints.{step}"),
+        level: gateway_plugin_sdk::call::host::LogLevel::Info,
+        fields: [("detail".to_owned(), json!(detail))]
+            .into_iter()
+            .collect(),
+    };
+    let reply = host.call("host.log", serde_json::to_value(&request).unwrap_or(json!({})), Vec::new());
+    let _ = reply.await;
+}
+
 pub async fn handle(handler: Handler, call: MiddlewareCall) -> Result<MiddlewareResponse, PluginFault> {
+    #[cfg(test)]
+    eprintln!("[probe] handle entered, model={:?}", call.request.head.model);
     let Handler { config, picker } = handler;
     if call.request.head.mount != MiddlewareMount::Request {
         return call.next.run(call.request).await;
@@ -36,7 +51,15 @@ pub async fn handle(handler: Handler, call: MiddlewareCall) -> Result<Middleware
         .filter(|(_, endpoint)| *endpoint == "/v1/responses")
         .and_then(|(model, _)| config.resolve_upstream(model).map(str::to_owned));
     let Some(upstream_model) = matched else {
-        return call.next.run(call.request).await;
+        #[cfg(test)]
+        eprintln!("[probe] passthrough: before trace");
+        trace(&call.host, "passthrough", "model not an alias").await;
+        #[cfg(test)]
+        eprintln!("[probe] passthrough: after trace, before next");
+        let result = call.next.run(call.request).await;
+        #[cfg(test)]
+        eprintln!("[probe] passthrough: after next");
+        return result;
     };
     let stream = call.request.head.transport
         == gateway_plugin_sdk::call::middleware::MiddlewareTransport::HttpSse;
@@ -64,10 +87,20 @@ pub async fn handle(handler: Handler, call: MiddlewareCall) -> Result<Middleware
             return Ok(error_response(400, "invalid_request", "request body must be valid JSON"));
         }
     };
+    trace(&call.host, "guard", "request body parsed").await;
     let prepared = match protocol::prepare_body(&source, &upstream_model, stream) {
         Ok(body) => body,
-        Err(error) => return Ok(protocol_error_response(error)),
+        Err(error) => {
+            trace(&call.host, "guard_reject", error.code).await;
+            return Ok(protocol_error_response(error));
+        }
     };
+    trace(
+        &call.host,
+        "prepared",
+        if stream { "streaming" } else { "non-streaming" },
+    )
+    .await;
     proxy(config, picker, call, prepared, stream).await
 }
 
@@ -80,8 +113,12 @@ async fn proxy(
 ) -> Result<MiddlewareResponse, PluginFault> {
     let credential = match picker.select(&call.host).await {
         Ok(credential) => credential,
-        Err(message) => return Ok(error_response(503, "no_available_account", &message)),
+        Err(message) => {
+            trace(&call.host, "select_failed", &message).await;
+            return Ok(error_response(503, "no_available_account", &message));
+        }
     };
+    trace(&call.host, "credential_ready", "oauth credential selected").await;
     let headers = upstream::auth_headers(
         &credential.access_token,
         &credential.chatgpt_account_id,
@@ -100,15 +137,10 @@ async fn proxy(
                 "Basis Points response exceeds configured limit",
             ));
         }
-        let content_type = header_value(&response.headers, "content-type")
-            .unwrap_or_else(|| "application/json".to_owned());
         return Ok(MiddlewareResponse::direct(
             "openai",
             response.status,
-            vec![MiddlewareHeader {
-                name: "content-type".to_owned(),
-                value: content_type.into_bytes(),
-            }],
+            Vec::new(),
             MiddlewareBody::from_frames(
                 MiddlewareBodyFraming::JsonDocument,
                 vec![MiddlewareBodyFrame::new(body, true)],
@@ -118,9 +150,13 @@ async fn proxy(
     let stream_response =
         match upstream::open_stream(&call.host, &url, headers, prepared).await {
             Ok(response) => response,
-            Err(error) => return Err(error),
+            Err(error) => {
+                trace(&call.host, "open_stream_fault", "managed http stream failed").await;
+                return Err(error);
+            }
         };
     if !(200..300).contains(&stream_response.status) {
+        trace(&call.host, "upstream_error", "non-2xx from basis points").await;
         let stream_id = stream_response.stream.clone().unwrap_or_default();
         let body = if stream_id.is_empty() {
             Vec::new()
@@ -139,16 +175,14 @@ async fn proxy(
         MiddlewareBody::channel(MiddlewareBodyFraming::SseEvent, NonZeroUsize::new(8).unwrap());
     let pump_host = call.host.clone();
     let maximum_bytes = config.max_response_bytes;
+    trace(&call.host, "pump_started", "streaming response to client").await;
     tokio::spawn(async move {
         pump_stream(pump_host, stream_id, sender, maximum_bytes).await;
     });
     Ok(MiddlewareResponse::direct(
         "openai",
         stream_response.status,
-        vec![MiddlewareHeader {
-            name: "content-type".to_owned(),
-            value: b"text/event-stream".to_vec(),
-        }],
+        Vec::new(),
         body,
     ))
 }
@@ -198,16 +232,12 @@ async fn pump_stream(
         }
     };
     if let Some(error) = failure {
+        upstream::trace_fault(&host, "pump_failed").await;
         let _ = sender.fail(error).await;
         let _ = upstream::close_stream(&host, &stream_id).await;
+    } else {
+        upstream::trace_fault(&host, "pump_completed").await;
     }
-}
-
-fn header_value(headers: &[(String, String)], name: &str) -> Option<String> {
-    headers
-        .iter()
-        .find(|(key, _)| key.eq_ignore_ascii_case(name))
-        .map(|(_, value)| value.clone())
 }
 
 fn protocol_error_response(error: ProtocolError) -> MiddlewareResponse {
@@ -259,10 +289,7 @@ pub fn error_response(status: u16, code: &str, message: &str) -> MiddlewareRespo
     MiddlewareResponse::direct(
         "openai",
         status,
-        vec![MiddlewareHeader {
-            name: "content-type".to_owned(),
-            value: b"application/json".to_vec(),
-        }],
+        Vec::new(),
         MiddlewareBody::from_frames(
             MiddlewareBodyFraming::RawBytes,
             vec![MiddlewareBodyFrame::new(body, true)],

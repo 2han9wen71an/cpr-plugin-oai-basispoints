@@ -210,3 +210,15 @@ fn decode<T: DeserializeOwned>(value: Value) -> Result<T, PluginFault> {
 pub(crate) fn fault(message: &'static str) -> PluginFault {
     PluginFault::new(gateway_plugin_sdk::ErrorCode::Fault, message)
 }
+
+/// 泵任务里的轻量留痕；仅记录事件名，不携带任何业务数据。
+pub async fn trace_fault(host: &HostClient, step: &'static str) {
+    let request = gateway_plugin_sdk::call::host::LogRequest {
+        event: format!("oai-basispoints.{step}"),
+        level: gateway_plugin_sdk::call::host::LogLevel::Info,
+        fields: Default::default(),
+    };
+    let _ = host
+        .call("host.log", serde_json::to_value(&request).unwrap_or(json!({})), Vec::new())
+        .await;
+}

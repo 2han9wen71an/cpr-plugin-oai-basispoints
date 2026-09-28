@@ -1,6 +1,6 @@
 [package]
 name = "cpr-plugin-oai-basispoints"
-version = "0.1.0"
+version = "0.1.2"
 edition = "2024"
 license = "MIT"
 publish = false
@@ -9,6 +9,10 @@ autotests = false
 [[test]]
 name = "protocol"
 path = "tests/protocol.rs"
+
+[[test]]
+name = "middleware_wire"
+path = "tests/middleware_wire.rs"
 
 [dependencies]
 gateway-plugin-sdk = { git = "https://github.com/zyycn/codex-proxy-rs.git", rev = "3cc6cc9e2f8769f62c2267d11ebc036c75ebd1ad", features = ["io"] }

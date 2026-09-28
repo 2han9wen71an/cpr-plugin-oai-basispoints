@@ -3,7 +3,7 @@
   "name": "oai-basispoints",
   "displayName": "OpenAI Basis Points",
   "publisher": "2han9wen71an",
-  "version": "0.1.0",
+  "version": "0.1.2",
   "description": "复用宿主 Codex OAuth 凭据接入 Basis Points（bps.openai.com），以短路中间件提供 Responses 流式代理",
   "license": "MIT",
   "author": "2han9wen71an",
