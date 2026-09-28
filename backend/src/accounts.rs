@@ -48,7 +48,10 @@ impl AccountPicker {
             .await
             .map_err(|error| format!("枚举账号失败：{error:?}"))?;
             for account in &page.accounts {
-                if account.enabled && account.authentication_kind == "oauth" {
+                if account.enabled
+                    && account.authentication_kind == "oauth"
+                    && account.credential_state == "ready"
+                {
                     candidates.push((
                         account.account_id.clone(),
                         account.access_token_expires_at_ms,

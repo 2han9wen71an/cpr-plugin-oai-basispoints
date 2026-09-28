@@ -3,7 +3,7 @@
   "name": "oai-basispoints",
   "displayName": "OpenAI Basis Points",
   "publisher": "2han9wen71an",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "description": "复用宿主 Codex OAuth 凭据接入 Basis Points（bps.openai.com），以短路中间件提供 Responses 流式代理",
   "license": "MIT",
   "author": "2han9wen71an",
@@ -13,8 +13,18 @@
   "main": "bin/plugin",
   "runtime": "trustedProcess",
   "contributes": {
-    "model_catalog": {},
+    "model_catalog": {
+      "id": "2han9wen71an.oai-basispoints.model-catalog",
+      "version": 1,
+      "stages": [
+        "registration"
+      ],
+      "inputFormats": [],
+      "outputFormats": []
+    },
     "middleware": {
+      "id": "2han9wen71an.oai-basispoints.middleware",
+      "version": 1,
       "stages": [
         "request"
       ],
