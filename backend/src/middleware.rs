@@ -298,6 +298,9 @@ async fn pump_stream(
                 Err(error) => {
                     if active_relay {
                         let _ = send_relay_failure(&sender, delivery.response_id()).await;
+                        let _ = sender
+                            .send(MiddlewareBodyFrame::new(b"data: [DONE]\n\n".to_vec(), true))
+                            .await;
                     } else {
                         let _ = sender
                             .fail(relay_error_fault("invalid_sse", &error.message()))
@@ -321,6 +324,9 @@ async fn pump_stream(
                     Err(error) => {
                         if active_relay {
                             let _ = send_relay_failure(&sender, delivery.response_id()).await;
+                            let _ = sender
+                                .send(MiddlewareBodyFrame::new(b"data: [DONE]\n\n".to_vec(), true))
+                                .await;
                         } else {
                             let _ = sender
                                 .fail(relay_error_fault("invalid_sse", &error.message()))
@@ -353,6 +359,9 @@ async fn pump_stream(
         Err(error) => {
             if active_relay {
                 let _ = send_relay_failure(&sender, delivery.response_id()).await;
+                let _ = sender
+                    .send(MiddlewareBodyFrame::new(b"data: [DONE]\n\n".to_vec(), true))
+                    .await;
             } else {
                 let _ = sender
                     .fail(relay_error_fault("invalid_sse", &error.message()))
