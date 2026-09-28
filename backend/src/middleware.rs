@@ -297,7 +297,7 @@ async fn pump_stream(
                     }
                     if done {
                         let _ = sender
-                            .send(MiddlewareBodyFrame::new(Vec::new(), true))
+                            .send(MiddlewareBodyFrame::new(b"data: [DONE]\n\n".to_vec(), true))
                             .await;
                         let _ = upstream::close_stream(&host, &stream_id).await;
                         return;
@@ -308,7 +308,7 @@ async fn pump_stream(
                         upstream::trace_fault(&host, relay_error_step(&error)).await;
                         let _ = send_relay_failure(&sender, delivery.response_id()).await;
                         let _ = sender
-                            .send(MiddlewareBodyFrame::new(Vec::new(), true))
+                            .send(MiddlewareBodyFrame::new(b"data: [DONE]\n\n".to_vec(), true))
                             .await;
                     } else {
                         let _ = sender
@@ -334,7 +334,7 @@ async fn pump_stream(
                         if active_relay {
                             let _ = send_relay_failure(&sender, delivery.response_id()).await;
                             let _ = sender
-                                .send(MiddlewareBodyFrame::new(Vec::new(), true))
+                                .send(MiddlewareBodyFrame::new(b"data: [DONE]\n\n".to_vec(), true))
                                 .await;
                         } else {
                             let _ = sender
