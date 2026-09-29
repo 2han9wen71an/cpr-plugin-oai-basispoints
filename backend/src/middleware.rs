@@ -289,9 +289,10 @@ async fn pump_stream(
 
         for frame in splitter.feed(&chunk) {
             let done = frame.done;
+            let source_terminal = !done && is_terminal_sse_frame(&frame.bytes);
             match delivery.accept(frame.bytes, done) {
                 Ok(frames) => {
-                    if send_frames(&sender, frames).await.is_err() {
+                    if send_frames(&sender, frames, source_terminal).await.is_err() {
                         let _ = upstream::close_stream(&host, &stream_id).await;
                         return;
                     }
@@ -321,9 +322,10 @@ async fn pump_stream(
         if eof {
             if let Some(frame) = splitter.finish() {
                 let done = frame.done;
+                let source_terminal = !done && is_terminal_sse_frame(&frame.bytes);
                 match delivery.accept(frame.bytes, done) {
                     Ok(frames) => {
-                        if send_frames(&sender, frames).await.is_err() {
+                        if send_frames(&sender, frames, source_terminal).await.is_err() {
                             let _ = upstream::close_stream(&host, &stream_id).await;
                             return;
                         }
@@ -364,7 +366,7 @@ async fn pump_stream(
     }
     match delivery.finish() {
         Ok(frames) => {
-            if send_frames(&sender, frames).await.is_err() {
+            if send_frames(&sender, frames, false).await.is_err() {
                 let _ = upstream::close_stream(&host, &stream_id).await;
             } else {
                 upstream::trace_fault(&host, "pump_completed").await;
@@ -390,11 +392,26 @@ async fn pump_stream(
 async fn send_frames(
     sender: &gateway_plugin_sdk::client::MiddlewareBodySender,
     frames: Vec<Vec<u8>>,
+    terminal: bool,
 ) -> Result<(), gateway_plugin_sdk::client::SessionError> {
-    for bytes in frames {
-        sender.send(MiddlewareBodyFrame::new(bytes, false)).await?;
+    let last_index = frames.len().saturating_sub(1);
+    for (index, bytes) in frames.into_iter().enumerate() {
+        sender
+            .send(MiddlewareBodyFrame::new(
+                bytes,
+                terminal && index == last_index,
+            ))
+            .await?;
     }
     Ok(())
+}
+
+fn is_terminal_sse_frame(bytes: &[u8]) -> bool {
+    sse::parse_sse_json_event(bytes)
+        .ok()
+        .flatten()
+        .and_then(|event| event.event_type().map(str::to_owned))
+        .is_some_and(|event_type| sse::is_terminal_event(&event_type))
 }
 
 /// Semantic SSE delivery state for one prepared relay request.
@@ -407,7 +424,6 @@ struct RelaySseDelivery {
     active: bool,
     tool_events_seen: bool,
     terminal_seen: bool,
-    done_seen: bool,
     response_id: Option<String>,
     tracker: SseStreamTracker,
 }
@@ -420,7 +436,6 @@ impl RelaySseDelivery {
             context,
             tool_events_seen: false,
             terminal_seen: false,
-            done_seen: false,
             response_id: None,
             tracker: SseStreamTracker::new(),
         }
@@ -442,14 +457,12 @@ impl RelaySseDelivery {
             if !self.terminal_seen {
                 return Err(RelayDeliveryError::MissingTerminal);
             }
-            self.done_seen = true;
-            // The pump maps this control frame to the SDK terminal bit.
             return Ok(Vec::new());
         }
         if !self.active {
             return Ok(vec![bytes]);
         }
-        if self.terminal_seen || self.done_seen {
+        if self.terminal_seen {
             return Err(RelayDeliveryError::EventsAfterTerminal);
         }
 
@@ -536,7 +549,7 @@ impl RelaySseDelivery {
     }
 
     fn finish(&self) -> Result<Vec<Vec<u8>>, RelayDeliveryError> {
-        if self.active && (!self.terminal_seen || !self.done_seen) {
+        if self.active && !self.terminal_seen {
             return Err(RelayDeliveryError::MissingTerminal);
         }
         Ok(Vec::new())
