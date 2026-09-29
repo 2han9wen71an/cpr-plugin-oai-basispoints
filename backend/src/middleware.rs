@@ -292,27 +292,15 @@ async fn pump_stream(
             let done = frame.done;
             match delivery.accept(frame.bytes, done) {
                 Ok(frames) => {
-                    let terminal = active_relay && delivery.terminal_seen;
-                    if send_frames(&sender, frames, terminal).await.is_err() {
-                        drop(sender);
-                        let _ = upstream::close_stream(&host, &stream_id).await;
-                        return;
-                    }
-                    if active_relay && delivery.terminal_seen {
+                    if send_frames(&sender, frames).await.is_err() {
                         drop(sender);
                         let _ = upstream::close_stream(&host, &stream_id).await;
                         return;
                     }
                     if done {
-                        if active_relay {
-                            drop(sender);
-                        } else {
-                            let _ = sender
-                                .send(MiddlewareBodyFrame::new(b"data: [DONE]\n\n".to_vec(), true))
-                                .await;
-                            drop(sender);
-                        }
+                        let _ = send_terminal_done(&sender).await;
                         let _ = upstream::close_stream(&host, &stream_id).await;
+                        drop(sender);
                         return;
                     }
                 }
@@ -320,6 +308,7 @@ async fn pump_stream(
                     if active_relay {
                         upstream::trace_fault(&host, relay_error_step(&error)).await;
                         let _ = send_relay_failure(&sender, delivery.response_id()).await;
+                        let _ = send_terminal_done(&sender).await;
                     } else {
                         let _ = sender
                             .fail(relay_error_fault("invalid_sse", &error.message()))
@@ -337,36 +326,22 @@ async fn pump_stream(
                 let done = frame.done;
                 match delivery.accept(frame.bytes, done) {
                     Ok(frames) => {
-                        let terminal = active_relay && delivery.terminal_seen;
-                        if send_frames(&sender, frames, terminal).await.is_err() {
-                            drop(sender);
-                            let _ = upstream::close_stream(&host, &stream_id).await;
-                            return;
-                        }
-                        if active_relay && delivery.terminal_seen {
+                        if send_frames(&sender, frames).await.is_err() {
                             drop(sender);
                             let _ = upstream::close_stream(&host, &stream_id).await;
                             return;
                         }
                         if done {
-                            if active_relay {
-                                drop(sender);
-                            } else {
-                                let _ = sender
-                                    .send(MiddlewareBodyFrame::new(
-                                        b"data: [DONE]\n\n".to_vec(),
-                                        true,
-                                    ))
-                                    .await;
-                                drop(sender);
-                            }
+                            let _ = send_terminal_done(&sender).await;
                             let _ = upstream::close_stream(&host, &stream_id).await;
+                            drop(sender);
                             return;
                         }
                     }
                     Err(error) => {
                         if active_relay {
                             let _ = send_relay_failure(&sender, delivery.response_id()).await;
+                            let _ = send_terminal_done(&sender).await;
                         } else {
                             let _ = sender
                                 .fail(relay_error_fault("invalid_sse", &error.message()))
@@ -378,6 +353,12 @@ async fn pump_stream(
                         return;
                     }
                 }
+            }
+            if delivery.terminal_seen && !delivery.done_seen {
+                let _ = send_terminal_done(&sender).await;
+                let _ = upstream::close_stream(&host, &stream_id).await;
+                drop(sender);
+                return;
             }
             break;
         }
@@ -392,7 +373,7 @@ async fn pump_stream(
     }
     match delivery.finish() {
         Ok(frames) => {
-            if send_frames(&sender, frames, false).await.is_err() {
+            if send_frames(&sender, frames).await.is_err() {
                 drop(sender);
                 let _ = upstream::close_stream(&host, &stream_id).await;
             } else {
@@ -402,6 +383,7 @@ async fn pump_stream(
         Err(error) => {
             if active_relay {
                 let _ = send_relay_failure(&sender, delivery.response_id()).await;
+                let _ = send_terminal_done(&sender).await;
             } else {
                 let _ = sender
                     .fail(relay_error_fault("invalid_sse", &error.message()))
@@ -414,16 +396,20 @@ async fn pump_stream(
     }
 }
 
+async fn send_terminal_done(
+    sender: &gateway_plugin_sdk::client::MiddlewareBodySender,
+) -> Result<(), gateway_plugin_sdk::client::SessionError> {
+    sender
+        .send(MiddlewareBodyFrame::new(b"data: [DONE]\n\n".to_vec(), true))
+        .await
+}
+
 async fn send_frames(
     sender: &gateway_plugin_sdk::client::MiddlewareBodySender,
     frames: Vec<Vec<u8>>,
-    terminal: bool,
 ) -> Result<(), gateway_plugin_sdk::client::SessionError> {
-    let last = frames.len().saturating_sub(1);
-    for (index, bytes) in frames.into_iter().enumerate() {
-        sender
-            .send(MiddlewareBodyFrame::new(bytes, terminal && index == last))
-            .await?;
+    for bytes in frames {
+        sender.send(MiddlewareBodyFrame::new(bytes, false)).await?;
     }
     Ok(())
 }
@@ -438,6 +424,7 @@ struct RelaySseDelivery {
     active: bool,
     tool_events_seen: bool,
     terminal_seen: bool,
+    done_seen: bool,
     response_id: Option<String>,
     tracker: SseStreamTracker,
 }
@@ -450,6 +437,7 @@ impl RelaySseDelivery {
             context,
             tool_events_seen: false,
             terminal_seen: false,
+            done_seen: false,
             response_id: None,
             tracker: SseStreamTracker::new(),
         }
@@ -465,12 +453,10 @@ impl RelaySseDelivery {
         done_frame: bool,
     ) -> Result<Vec<Vec<u8>>, RelayDeliveryError> {
         if done_frame {
-            if !self.active {
-                return Ok(Vec::new());
-            }
-            if !self.terminal_seen {
+            if self.active && !self.terminal_seen {
                 return Err(RelayDeliveryError::MissingTerminal);
             }
+            self.done_seen = true;
             return Ok(Vec::new());
         }
         if !self.active {
@@ -563,7 +549,7 @@ impl RelaySseDelivery {
     }
 
     fn finish(&self) -> Result<Vec<Vec<u8>>, RelayDeliveryError> {
-        if self.active && !self.terminal_seen {
+        if self.active && (!self.terminal_seen || !self.done_seen) {
             return Err(RelayDeliveryError::MissingTerminal);
         }
         Ok(Vec::new())
