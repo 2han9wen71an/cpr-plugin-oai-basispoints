@@ -289,19 +289,16 @@ async fn pump_stream(
 
         for frame in splitter.feed(&chunk) {
             let done = frame.done;
-            let source_terminal = !done && is_terminal_sse_frame(&frame.bytes);
             match delivery.accept(frame.bytes, done) {
                 Ok(frames) => {
-                    if send_frames(&sender, frames, source_terminal).await.is_err() {
+                    if send_frames(&sender, frames).await.is_err() {
                         let _ = upstream::close_stream(&host, &stream_id).await;
                         return;
                     }
                     if done {
-                        if !active_relay {
-                            let _ = sender
-                                .send(MiddlewareBodyFrame::new(b"data: [DONE]\n\n".to_vec(), true))
-                                .await;
-                        }
+                        let _ = sender
+                            .send(MiddlewareBodyFrame::new(b"data: [DONE]\n\n".to_vec(), true))
+                            .await;
                         let _ = upstream::close_stream(&host, &stream_id).await;
                         return;
                     }
@@ -310,9 +307,6 @@ async fn pump_stream(
                     if active_relay {
                         upstream::trace_fault(&host, relay_error_step(&error)).await;
                         let _ = send_relay_failure(&sender, delivery.response_id()).await;
-                        let _ = sender
-                            .send(MiddlewareBodyFrame::new(b"data: [DONE]\n\n".to_vec(), true))
-                            .await;
                     } else {
                         let _ = sender
                             .fail(relay_error_fault("invalid_sse", &error.message()))
@@ -327,10 +321,9 @@ async fn pump_stream(
         if eof {
             if let Some(frame) = splitter.finish() {
                 let done = frame.done;
-                let source_terminal = !done && is_terminal_sse_frame(&frame.bytes);
                 match delivery.accept(frame.bytes, done) {
                     Ok(frames) => {
-                        if send_frames(&sender, frames, source_terminal).await.is_err() {
+                        if send_frames(&sender, frames).await.is_err() {
                             let _ = upstream::close_stream(&host, &stream_id).await;
                             return;
                         }
@@ -345,9 +338,6 @@ async fn pump_stream(
                     Err(error) => {
                         if active_relay {
                             let _ = send_relay_failure(&sender, delivery.response_id()).await;
-                            let _ = sender
-                                .send(MiddlewareBodyFrame::new(b"data: [DONE]\n\n".to_vec(), true))
-                                .await;
                         } else {
                             let _ = sender
                                 .fail(relay_error_fault("invalid_sse", &error.message()))
@@ -371,7 +361,7 @@ async fn pump_stream(
     }
     match delivery.finish() {
         Ok(frames) => {
-            if send_frames(&sender, frames, false).await.is_err() {
+            if send_frames(&sender, frames).await.is_err() {
                 let _ = upstream::close_stream(&host, &stream_id).await;
             } else {
                 upstream::trace_fault(&host, "pump_completed").await;
@@ -380,9 +370,6 @@ async fn pump_stream(
         Err(error) => {
             if active_relay {
                 let _ = send_relay_failure(&sender, delivery.response_id()).await;
-                let _ = sender
-                    .send(MiddlewareBodyFrame::new(b"data: [DONE]\n\n".to_vec(), true))
-                    .await;
             } else {
                 let _ = sender
                     .fail(relay_error_fault("invalid_sse", &error.message()))
@@ -397,26 +384,11 @@ async fn pump_stream(
 async fn send_frames(
     sender: &gateway_plugin_sdk::client::MiddlewareBodySender,
     frames: Vec<Vec<u8>>,
-    terminal: bool,
 ) -> Result<(), gateway_plugin_sdk::client::SessionError> {
-    let last_index = frames.len().saturating_sub(1);
-    for (index, bytes) in frames.into_iter().enumerate() {
-        sender
-            .send(MiddlewareBodyFrame::new(
-                bytes,
-                terminal && index == last_index,
-            ))
-            .await?;
+    for bytes in frames {
+        sender.send(MiddlewareBodyFrame::new(bytes, false)).await?;
     }
     Ok(())
-}
-
-fn is_terminal_sse_frame(bytes: &[u8]) -> bool {
-    sse::parse_sse_json_event(bytes)
-        .ok()
-        .flatten()
-        .and_then(|event| event.event_type().map(str::to_owned))
-        .is_some_and(|event_type| sse::is_terminal_event(&event_type))
 }
 
 /// Semantic SSE delivery state for one prepared relay request.
@@ -771,11 +743,8 @@ async fn send_relay_failure(
     sender
         .send(MiddlewareBodyFrame::new(
             encode_sse_frame("response.failed", &event),
-            false,
+            true,
         ))
-        .await?;
-    sender
-        .send(MiddlewareBodyFrame::new(b"data: [DONE]\n\n".to_vec(), true))
         .await
 }
 
