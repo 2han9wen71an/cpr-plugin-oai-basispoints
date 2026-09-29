@@ -269,6 +269,7 @@ async fn pump_stream(
         let read = tokio::select! {
             biased;
             () = cancellation.cancelled() => {
+                drop(sender);
                 let _ = upstream::close_stream(&host, &stream_id).await;
                 return;
             }
@@ -291,14 +292,26 @@ async fn pump_stream(
             let done = frame.done;
             match delivery.accept(frame.bytes, done) {
                 Ok(frames) => {
-                    if send_frames(&sender, frames).await.is_err() {
+                    let terminal = active_relay && delivery.terminal_seen;
+                    if send_frames(&sender, frames, terminal).await.is_err() {
+                        drop(sender);
+                        let _ = upstream::close_stream(&host, &stream_id).await;
+                        return;
+                    }
+                    if active_relay && delivery.terminal_seen {
+                        drop(sender);
                         let _ = upstream::close_stream(&host, &stream_id).await;
                         return;
                     }
                     if done {
-                        let _ = sender
-                            .send(MiddlewareBodyFrame::new(b"data: [DONE]\n\n".to_vec(), true))
-                            .await;
+                        if active_relay {
+                            drop(sender);
+                        } else {
+                            let _ = sender
+                                .send(MiddlewareBodyFrame::new(b"data: [DONE]\n\n".to_vec(), true))
+                                .await;
+                            drop(sender);
+                        }
                         let _ = upstream::close_stream(&host, &stream_id).await;
                         return;
                     }
@@ -313,6 +326,7 @@ async fn pump_stream(
                             .await;
                     }
                     upstream::trace_fault(&host, "relay_stream_failed").await;
+                    drop(sender);
                     let _ = upstream::close_stream(&host, &stream_id).await;
                     return;
                 }
@@ -323,14 +337,29 @@ async fn pump_stream(
                 let done = frame.done;
                 match delivery.accept(frame.bytes, done) {
                     Ok(frames) => {
-                        if send_frames(&sender, frames).await.is_err() {
+                        let terminal = active_relay && delivery.terminal_seen;
+                        if send_frames(&sender, frames, terminal).await.is_err() {
+                            drop(sender);
+                            let _ = upstream::close_stream(&host, &stream_id).await;
+                            return;
+                        }
+                        if active_relay && delivery.terminal_seen {
+                            drop(sender);
                             let _ = upstream::close_stream(&host, &stream_id).await;
                             return;
                         }
                         if done {
-                            let _ = sender
-                                .send(MiddlewareBodyFrame::new(b"data: [DONE]\n\n".to_vec(), true))
-                                .await;
+                            if active_relay {
+                                drop(sender);
+                            } else {
+                                let _ = sender
+                                    .send(MiddlewareBodyFrame::new(
+                                        b"data: [DONE]\n\n".to_vec(),
+                                        true,
+                                    ))
+                                    .await;
+                                drop(sender);
+                            }
                             let _ = upstream::close_stream(&host, &stream_id).await;
                             return;
                         }
@@ -344,6 +373,7 @@ async fn pump_stream(
                                 .await;
                         }
                         upstream::trace_fault(&host, "relay_stream_failed").await;
+                        drop(sender);
                         let _ = upstream::close_stream(&host, &stream_id).await;
                         return;
                     }
@@ -356,12 +386,14 @@ async fn pump_stream(
     if let Some(error) = stream_failure {
         upstream::trace_fault(&host, "pump_failed").await;
         let _ = sender.fail(error).await;
+        drop(sender);
         let _ = upstream::close_stream(&host, &stream_id).await;
         return;
     }
     match delivery.finish() {
         Ok(frames) => {
-            if send_frames(&sender, frames).await.is_err() {
+            if send_frames(&sender, frames, false).await.is_err() {
+                drop(sender);
                 let _ = upstream::close_stream(&host, &stream_id).await;
             } else {
                 upstream::trace_fault(&host, "pump_completed").await;
@@ -376,6 +408,7 @@ async fn pump_stream(
                     .await;
             }
             upstream::trace_fault(&host, "relay_terminal_invalid").await;
+            drop(sender);
             let _ = upstream::close_stream(&host, &stream_id).await;
         }
     }
@@ -384,9 +417,13 @@ async fn pump_stream(
 async fn send_frames(
     sender: &gateway_plugin_sdk::client::MiddlewareBodySender,
     frames: Vec<Vec<u8>>,
+    terminal: bool,
 ) -> Result<(), gateway_plugin_sdk::client::SessionError> {
-    for bytes in frames {
-        sender.send(MiddlewareBodyFrame::new(bytes, false)).await?;
+    let last = frames.len().saturating_sub(1);
+    for (index, bytes) in frames.into_iter().enumerate() {
+        sender
+            .send(MiddlewareBodyFrame::new(bytes, terminal && index == last))
+            .await?;
     }
     Ok(())
 }
