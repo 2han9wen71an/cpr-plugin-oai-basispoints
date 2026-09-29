@@ -297,6 +297,11 @@ async fn pump_stream(
                         return;
                     }
                     if done {
+                        if !active_relay {
+                            let _ = sender
+                                .send(MiddlewareBodyFrame::new(b"data: [DONE]\n\n".to_vec(), true))
+                                .await;
+                        }
                         let _ = upstream::close_stream(&host, &stream_id).await;
                         return;
                     }
