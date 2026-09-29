@@ -32,6 +32,7 @@ impl AccountPicker {
     pub async fn select(
         &self,
         host: &gateway_plugin_sdk::client::HostClient,
+        config: &crate::config::RuntimeConfig,
     ) -> Result<SelectedCredential, String> {
         let mut cursor = None;
         let mut candidates: Vec<(String, Option<i64>)> = Vec::new();
@@ -51,6 +52,11 @@ impl AccountPicker {
                 if account.enabled
                     && account.authentication_kind == "oauth"
                     && account.credential_state == "ready"
+                    && config.account_allowed(
+                        &account.account_id,
+                        account.email.as_deref(),
+                        &account.name,
+                    )
                 {
                     candidates.push((
                         account.account_id.clone(),
@@ -64,7 +70,13 @@ impl AccountPicker {
             }
         }
         if candidates.is_empty() {
-            return Err("宿主没有启用的 openai OAuth 账号".to_owned());
+            if config.allowed_accounts.is_empty() {
+                return Err("宿主没有启用的 openai OAuth 账号".to_owned());
+            }
+            return Err(format!(
+                "宿主没有启用的、匹配 allowedAccounts 白名单的 openai OAuth 账号（配置了 {} 个允许项）",
+                config.allowed_accounts.len()
+            ));
         }
         // 优先非过期账号；全部过期时仍取过期最晚的一个，让上游给出明确错误。
         let now_ms = std::time::SystemTime::now()

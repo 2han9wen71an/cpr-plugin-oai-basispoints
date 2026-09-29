@@ -27,6 +27,29 @@ fn config_parses_defaults_and_resolves_aliases() {
     );
     assert_eq!(config.resolve_upstream("gpt-5.3-codex"), None);
     assert_eq!(config.max_response_bytes, 64 * 1024 * 1024);
+    assert!(config.allowed_accounts.is_empty());
+}
+
+#[test]
+fn config_parses_allowed_accounts_and_filters() {
+    let cfg = RuntimeConfig::from_configuration(&json!({
+        "responsesUrl": "https://bps.openai.com/basispoints/api/responses",
+        "models": [{"alias": "a", "upstreamModel": "b"}],
+        "allowedAccounts": ["acct_123", "User@Domain.com"]
+    }))
+    .unwrap();
+    assert_eq!(cfg.allowed_accounts, vec!["acct_123", "user@domain.com"]);
+    assert!(cfg.account_allowed("ACCT_123", Some("other@foo.com"), "my account"));
+    assert!(cfg.account_allowed("acct_999", Some("USER@domain.com"), "other"));
+    assert!(!cfg.account_allowed("acct_999", Some("stranger@foo.com"), "other"));
+
+    // Empty list allows all
+    let cfg_all = RuntimeConfig::from_configuration(&json!({
+        "responsesUrl": "https://bps.openai.com/basispoints/api/responses",
+        "models": [{"alias": "a", "upstreamModel": "b"}]
+    }))
+    .unwrap();
+    assert!(cfg_all.account_allowed("any_id", Some("any@any.com"), "any"));
 }
 
 #[test]

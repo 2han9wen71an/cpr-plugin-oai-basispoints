@@ -3,7 +3,7 @@
   "name": "oai-basispoints",
   "displayName": "OpenAI Basis Points",
   "publisher": "2han9wen71an",
-  "version": "0.2.18",
+  "version": "0.2.19",
   "description": "复用宿主 Codex OAuth 凭据接入 Basis Points（bps.openai.com），以短路中间件提供 Responses 流式代理",
   "license": "MIT",
   "author": "2han9wen71an",
@@ -103,6 +103,17 @@
         "maximum": 134217728,
         "default": 67108864,
         "title": "上游响应体大小上限（字节）"
+      },
+      "allowedAccounts": {
+        "type": "array",
+        "title": "允许代理 Basis Points 的账号白名单（account id / 邮箱 / 账号名称）",
+        "description": "留空表示使用宿主所有启用的 openai OAuth 账号；指定后仅在匹配的账号间轮询",
+        "items": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "default": []
       }
     }
   }

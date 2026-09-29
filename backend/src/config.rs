@@ -7,6 +7,9 @@ pub struct RuntimeConfig {
     pub models: Vec<ModelMapping>,
     pub catalog_target: String,
     pub max_response_bytes: usize,
+    /// 允许代理 Basis Points 的账号（account id / email / 名称，大小写不敏感）。
+    /// 空列表表示不限制，沿用宿主全部启用的 openai OAuth 账号。
+    pub allowed_accounts: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -88,11 +91,46 @@ impl RuntimeConfig {
                 )));
             }
         }
+        let allowed_accounts = match object.get("allowedAccounts") {
+            None | Some(Value::Null) => Vec::new(),
+            Some(Value::Array(items)) => {
+                let mut accounts = Vec::with_capacity(items.len());
+                for item in items {
+                    let text = item
+                        .as_str()
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .ok_or_else(|| {
+                            InvalidConfig("allowedAccounts 条目必须是非空字符串".to_owned())
+                        })?;
+                    accounts.push(text.to_ascii_lowercase());
+                }
+                accounts
+            }
+            Some(_) => return Err(InvalidConfig("allowedAccounts 必须是数组".to_owned())),
+        };
         Ok(Self {
             responses_url,
             models,
             catalog_target,
             max_response_bytes,
+            allowed_accounts,
+        })
+    }
+
+    /// 检查指定账号是否在白名单中。白名单为空时全部允许。
+    #[must_use]
+    pub fn account_allowed(&self, account_id: &str, email: Option<&str>, name: &str) -> bool {
+        if self.allowed_accounts.is_empty() {
+            return true;
+        }
+        let id_lower = account_id.to_ascii_lowercase();
+        let name_lower = name.to_ascii_lowercase();
+        let email_lower = email.map(str::to_ascii_lowercase);
+        self.allowed_accounts.iter().any(|pattern| {
+            pattern == &id_lower
+                || pattern == &name_lower
+                || email_lower.as_deref().is_some_and(|e| e == pattern)
         })
     }
 

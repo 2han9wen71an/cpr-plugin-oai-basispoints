@@ -138,7 +138,7 @@ async fn proxy(
     prepared: PreparedRequest,
     stream: bool,
 ) -> Result<MiddlewareResponse, PluginFault> {
-    let credential = match picker.select(&call.host).await {
+    let credential = match picker.select(&call.host, &config).await {
         Ok(credential) => credential,
         Err(message) => {
             trace(&call.host, "select_failed", &message).await;
