@@ -263,14 +263,13 @@ async fn pump_stream(
     let mut delivery = RelaySseDelivery::new(relay);
     let mut splitter = SseFrameSplitter::new();
     let mut delivered = 0usize;
-    let mut stream_failure = None;
 
     loop {
         let read = tokio::select! {
             biased;
             () = cancellation.cancelled() => {
-                drop(sender);
                 let _ = upstream::close_stream(&host, &stream_id).await;
+                drop(sender);
                 return;
             }
             result = upstream::read_stream_chunk(&host, &stream_id) => result,
@@ -278,32 +277,26 @@ async fn pump_stream(
         let (eof, chunk) = match read {
             Ok(value) => value,
             Err(error) => {
-                stream_failure = Some(error);
-                break;
+                upstream::trace_fault(&host, "pump_failed").await;
+                let _ = sender.fail(error).await;
+                let _ = upstream::close_stream(&host, &stream_id).await;
+                drop(sender);
+                return;
             }
         };
         delivered = delivered.saturating_add(chunk.len());
         if delivered > maximum_bytes {
-            stream_failure = Some(upstream::fault("上游响应超过大小上限"));
-            break;
+            upstream::trace_fault(&host, "pump_failed").await;
+            let _ = sender.fail(upstream::fault("上游响应超过大小上限")).await;
+            let _ = upstream::close_stream(&host, &stream_id).await;
+            drop(sender);
+            return;
         }
 
         for frame in splitter.feed(&chunk) {
             let done = frame.done;
-            match delivery.accept(frame.bytes, done) {
-                Ok(frames) => {
-                    if send_frames(&sender, frames).await.is_err() {
-                        drop(sender);
-                        let _ = upstream::close_stream(&host, &stream_id).await;
-                        return;
-                    }
-                    if done {
-                        let _ = send_terminal_done(&sender).await;
-                        let _ = upstream::close_stream(&host, &stream_id).await;
-                        drop(sender);
-                        return;
-                    }
-                }
+            let frames = match delivery.accept(frame.bytes, done) {
+                Ok(frames) => frames,
                 Err(error) => {
                     if active_relay {
                         upstream::trace_fault(&host, relay_error_step(&error)).await;
@@ -314,30 +307,32 @@ async fn pump_stream(
                             .fail(relay_error_fault("invalid_sse", &error.message()))
                             .await;
                     }
-                    upstream::trace_fault(&host, "relay_stream_failed").await;
-                    drop(sender);
                     let _ = upstream::close_stream(&host, &stream_id).await;
+                    drop(sender);
                     return;
                 }
+            };
+            if send_frames(&sender, frames).await.is_err() {
+                let _ = upstream::close_stream(&host, &stream_id).await;
+                drop(sender);
+                return;
+            }
+            if done {
+                // The only GMB1 terminal frame is emitted after the upstream
+                // sentinel has been parsed, then the managed stream is closed
+                // before dropping the sender so RPC End follows close_stream.
+                let _ = send_terminal_done(&sender).await;
+                let _ = upstream::close_stream(&host, &stream_id).await;
+                drop(sender);
+                return;
             }
         }
+
         if eof {
             if let Some(frame) = splitter.finish() {
                 let done = frame.done;
-                match delivery.accept(frame.bytes, done) {
-                    Ok(frames) => {
-                        if send_frames(&sender, frames).await.is_err() {
-                            drop(sender);
-                            let _ = upstream::close_stream(&host, &stream_id).await;
-                            return;
-                        }
-                        if done {
-                            let _ = send_terminal_done(&sender).await;
-                            let _ = upstream::close_stream(&host, &stream_id).await;
-                            drop(sender);
-                            return;
-                        }
-                    }
+                let frames = match delivery.accept(frame.bytes, done) {
+                    Ok(frames) => frames,
                     Err(error) => {
                         if active_relay {
                             let _ = send_relay_failure(&sender, delivery.response_id()).await;
@@ -347,13 +342,26 @@ async fn pump_stream(
                                 .fail(relay_error_fault("invalid_sse", &error.message()))
                                 .await;
                         }
-                        upstream::trace_fault(&host, "relay_stream_failed").await;
-                        drop(sender);
                         let _ = upstream::close_stream(&host, &stream_id).await;
+                        drop(sender);
                         return;
                     }
+                };
+                if send_frames(&sender, frames).await.is_err() {
+                    let _ = upstream::close_stream(&host, &stream_id).await;
+                    drop(sender);
+                    return;
+                }
+                if done {
+                    let _ = send_terminal_done(&sender).await;
+                    let _ = upstream::close_stream(&host, &stream_id).await;
+                    drop(sender);
+                    return;
                 }
             }
+            // Some Basis Points responses close after response.completed without
+            // sending the conventional DONE sentinel. Complete that stream in
+            // the host contract rather than waiting for a second frame.
             if delivery.terminal_seen && !delivery.done_seen {
                 let _ = send_terminal_done(&sender).await;
                 let _ = upstream::close_stream(&host, &stream_id).await;
@@ -364,36 +372,22 @@ async fn pump_stream(
         }
     }
 
-    if let Some(error) = stream_failure {
-        upstream::trace_fault(&host, "pump_failed").await;
-        let _ = sender.fail(error).await;
-        drop(sender);
+    if let Err(error) = delivery.finish() {
+        if active_relay {
+            let _ = send_relay_failure(&sender, delivery.response_id()).await;
+            let _ = send_terminal_done(&sender).await;
+        } else {
+            let _ = sender
+                .fail(relay_error_fault("invalid_sse", &error.message()))
+                .await;
+        }
         let _ = upstream::close_stream(&host, &stream_id).await;
+        drop(sender);
         return;
     }
-    match delivery.finish() {
-        Ok(frames) => {
-            if send_frames(&sender, frames).await.is_err() {
-                drop(sender);
-                let _ = upstream::close_stream(&host, &stream_id).await;
-            } else {
-                upstream::trace_fault(&host, "pump_completed").await;
-            }
-        }
-        Err(error) => {
-            if active_relay {
-                let _ = send_relay_failure(&sender, delivery.response_id()).await;
-                let _ = send_terminal_done(&sender).await;
-            } else {
-                let _ = sender
-                    .fail(relay_error_fault("invalid_sse", &error.message()))
-                    .await;
-            }
-            upstream::trace_fault(&host, "relay_terminal_invalid").await;
-            drop(sender);
-            let _ = upstream::close_stream(&host, &stream_id).await;
-        }
-    }
+    upstream::trace_fault(&host, "pump_completed").await;
+    let _ = upstream::close_stream(&host, &stream_id).await;
+    drop(sender);
 }
 
 async fn send_terminal_done(
