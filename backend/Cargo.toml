@@ -1,6 +1,6 @@
 [package]
 name = "cpr-plugin-oai-basispoints"
-version = "0.2.16"
+version = "0.2.17"
 edition = "2024"
 license = "MIT"
 publish = false
@@ -15,7 +15,7 @@ name = "middleware_wire"
 path = "tests/middleware_wire.rs"
 
 [dependencies]
-gateway-plugin-sdk = { git = "https://github.com/zyycn/codex-proxy-rs.git", rev = "3cc6cc9e2f8769f62c2267d11ebc036c75ebd1ad", features = ["io"] }
+gateway-plugin-sdk = { git = "https://github.com/zyycn/codex-proxy-rs.git", rev = "3915aa259bb558bb285784b57ba6b3b43abefd93", features = ["io"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"
 sha1 = "0.10.6"
