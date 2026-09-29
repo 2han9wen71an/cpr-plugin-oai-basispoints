@@ -175,9 +175,13 @@ async fn proxy(
                 Err(error) => return Ok(error_response(422, error.code, &error.message)),
             }
         } else {
-            // Without a client relay catalog, preserve the upstream body byte
-            // for byte even if it happens to contain tool-shaped JSON.
-            body
+            // Without a client relay catalog there is nothing to translate, but
+            // Basis Points answers `stream: false` with a full SSE document, so
+            // the body still has to be normalized into one JSON document.
+            match normalize_non_stream_body(&body) {
+                Ok(body) => body,
+                Err(error) => return Ok(error_response(502, error.code, &error.message)),
+            }
         };
         return Ok(MiddlewareResponse::direct(
             "openai",
@@ -765,6 +769,42 @@ async fn send_relay_failure(
         .await
 }
 
+/// Normalize a non-stream upstream body into a single strict JSON document.
+///
+/// Basis Points answers `stream: false` requests with a full SSE document in
+/// practice, so a JSON document passes through untouched while an SSE document
+/// is collapsed to the terminal response snapshot. Any other shape is rejected:
+/// the host only delivers middleware JSON responses that serde can parse.
+fn normalize_non_stream_body(body: &[u8]) -> Result<Vec<u8>, RelayError> {
+    if serde_json::from_slice::<serde_json::Value>(body).is_ok() {
+        return Ok(body.to_vec());
+    }
+    for event in sse::parse_sse_events(body) {
+        if event.is_done() {
+            break;
+        }
+        let Ok(event) = sse::parse_json_event(&event) else {
+            continue;
+        };
+        if matches!(
+            event.event_type(),
+            Some("response.completed" | "response.incomplete")
+        ) {
+            let response = event.value().get("response").unwrap_or(event.value());
+            return serde_json::to_vec(response).map_err(|_| RelayError {
+                status: 502,
+                code: "relay_encoding_failed",
+                message: "client response could not be encoded".to_owned(),
+            });
+        }
+    }
+    Err(RelayError {
+        status: 502,
+        code: "invalid_upstream_response",
+        message: "Basis Points returned no terminal JSON response".to_owned(),
+    })
+}
+
 fn transform_json_response(relay: &RelayContext, body: &[u8]) -> Result<Vec<u8>, RelayError> {
     if let Ok(response) = serde_json::from_slice::<Value>(body) {
         return transform_json_value(relay, &response, body);
@@ -927,5 +967,35 @@ mod tests {
             transform_json_response(prepared.relay_context(), body).expect("response transform"),
             body
         );
+    }
+
+    #[test]
+    fn non_stream_body_passes_json_through_untouched() {
+        let body = br#"{"id":"resp_1","status":"completed","output":[]}"#;
+        assert_eq!(
+            normalize_non_stream_body(body).expect("json passthrough"),
+            body.to_vec()
+        );
+    }
+
+    #[test]
+    fn non_stream_body_collapses_sse_document_to_terminal_response() {
+        let body = b"event: response.created\n\
+                     data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_1\"}}\n\n\
+                     event: response.completed\n\
+                     data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"status\":\"completed\",\"output\":[{\"type\":\"message\"}]}}\n\n\
+                     data: [DONE]\n\n";
+        let normalized = normalize_non_stream_body(body).expect("sse collapse");
+        let value: serde_json::Value = serde_json::from_slice(&normalized).expect("json");
+        assert_eq!(value["status"], "completed");
+        assert_eq!(value["output"][0]["type"], "message");
+    }
+
+    #[test]
+    fn non_stream_body_rejects_documents_without_terminal_response() {
+        let body = b"event: response.created\n\
+                     data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_1\"}}\n\n";
+        let error = normalize_non_stream_body(body).expect_err("missing terminal");
+        assert_eq!(error.code, "invalid_upstream_response");
     }
 }
