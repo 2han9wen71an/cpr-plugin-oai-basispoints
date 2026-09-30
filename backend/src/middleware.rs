@@ -4,7 +4,7 @@ use std::sync::Arc;
 use gateway_plugin_sdk::{
     PluginFault,
     call::middleware::{MiddlewareBodyFrame, MiddlewareBodyFraming, MiddlewareMount},
-    client::{CallCancellation, MiddlewareBody, MiddlewareCall, MiddlewareResponse},
+    client::{CallCancellation, MiddlewareBody, MiddlewareResponse, RequestCall},
 };
 use serde_json::{Map, Value, json};
 
@@ -39,7 +39,7 @@ async fn trace(host: &gateway_plugin_sdk::client::HostClient, step: &str, detail
 
 pub async fn handle(
     handler: Handler,
-    call: MiddlewareCall,
+    call: RequestCall,
 ) -> Result<MiddlewareResponse, PluginFault> {
     #[cfg(test)]
     eprintln!(
@@ -79,13 +79,6 @@ pub async fn handle(
     ) {
         // WS 等传输形态 v0.1 不支持短路，保持原生路径。
         return call.next.run(call.request).await;
-    }
-    if !call.request.head.body_visible {
-        return Ok(error_response(
-            500,
-            "plugin_error",
-            "请求正文未向插件投影，无法代理 Basis Points",
-        ));
     }
     let source = match serde_json::from_slice::<Value>(&call.request.body) {
         Ok(Value::Object(source)) => source,
@@ -134,7 +127,7 @@ pub async fn handle(
 async fn proxy(
     config: Arc<RuntimeConfig>,
     picker: Arc<AccountPicker>,
-    call: MiddlewareCall,
+    call: RequestCall,
     prepared: PreparedRequest,
     stream: bool,
 ) -> Result<MiddlewareResponse, PluginFault> {

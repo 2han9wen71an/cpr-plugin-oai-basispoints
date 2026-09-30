@@ -1,5 +1,3 @@
-use std::collections::BTreeSet;
-
 use cpr_plugin_oai_basispoints::{PLUGIN_ID, manifest, plugin};
 use gateway_plugin_sdk::client::{PluginSession, SessionConfig, SessionError};
 
@@ -12,15 +10,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     )
     .await?;
     let manifest = manifest()?;
-    let granted = session
-        .handshake()
-        .permissions
-        .iter()
-        .copied()
-        .collect::<BTreeSet<_>>();
     if session.handshake().plugin_id != PLUGIN_ID
         || session.handshake().contributes != manifest.contributes
-        || granted != manifest.permissions
     {
         return Err(SessionError::Handshake.into());
     }

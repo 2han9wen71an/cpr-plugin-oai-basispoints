@@ -50,14 +50,14 @@ def main():
         if "middleware" in manifest["contributes"]:
             mw = manifest["contributes"]["middleware"]
             mw.setdefault("id", f"{plugin_id}.middleware")
-            mw.setdefault("version", 1)
+            mw.setdefault("version", 3)
             mw.setdefault("stages", ["request"])
             mw.setdefault("inputFormats", ["openai"])
             mw.setdefault("outputFormats", ["openai"])
 
     # Set single-target package metadata required by CPR runtime inspection
     manifest["package"] = {
-        "protocolVersion": 1,
+        "protocolVersion": 2,
         "target": {
             "os": args.os,
             "architecture": args.arch

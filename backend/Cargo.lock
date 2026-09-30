@@ -25,7 +25,7 @@ checksum = "4e7648175b45a9a48536d676f68d918270699102aa8dab5496df06904c914600"
 
 [[package]]
 name = "cpr-plugin-oai-basispoints"
-version = "0.2.16"
+version = "0.3.0"
 dependencies = [
  "gateway-plugin-sdk",
  "serde",
@@ -67,7 +67,7 @@ dependencies = [
 [[package]]
 name = "gateway-plugin-sdk"
 version = "0.1.0"
-source = "git+https://github.com/zyycn/codex-proxy-rs.git?rev=3915aa259bb558bb285784b57ba6b3b43abefd93#3915aa259bb558bb285784b57ba6b3b43abefd93"
+source = "git+https://github.com/zyycn/codex-proxy-rs.git?rev=e30aad475560b94db2d999e2251d180e45d52671#e30aad475560b94db2d999e2251d180e45d52671"
 dependencies = [
  "semver",
  "serde",

@@ -63,11 +63,6 @@ async fn start_session(
                     "catalogTarget": "gpt-5.3-codex",
                     "maxResponseBytes": 67108864
                 }),
-                permissions: vec![
-                    gateway_plugin_sdk::Permission::Network,
-                    gateway_plugin_sdk::Permission::Accounts,
-                    gateway_plugin_sdk::Permission::Requests,
-                ],
                 contributes,
             },
         }),
@@ -106,6 +101,7 @@ async fn send_call(
                     incarnation: "test-incarnation".into(),
                     stage,
                     timeout_ms: 2_000,
+                    resource_stream: false,
                     resource_scope_id: format!("scope-{id}"),
                     request_id: Some("req-test".into()),
                     attempt_id: None,
@@ -130,7 +126,11 @@ async fn receive(host: &mut HostPeer) -> Frame {
 
 fn request_head(model: &str) -> Value {
     let head = MiddlewareRequestHead {
+        settings_sources: json!({}),
+        settings: json!({}),
         request_id: "req-test".into(),
+        client_key_id: "test-key".into(),
+        account_group_ids: Vec::new(),
         mount: gateway_plugin_sdk::call::middleware::MiddlewareMount::Request,
         attempt_index: None,
         operation: "responses.create".into(),
@@ -144,7 +144,6 @@ fn request_head(model: &str) -> Value {
             name: "content-type".into(),
             value: b"application/json".to_vec(),
         }],
-        body_visible: true,
     };
     serde_json::to_value(&head).unwrap()
 }
